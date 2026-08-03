@@ -1,0 +1,14 @@
+[general]
+name=Sincronizador de Plugins e Configurações
+qgisMinimumVersion=3.0
+qgisMaximumVersion=3.99
+description=Sincroniza seus plugins instalados e suas configurações do QSettings entre diferentes máquinas ou versões do QGIS.
+about=Este plugin permite fazer backup e restaurar a lista de plugins instalados no QGIS, incluindo as suas configurações de QSettings. Ele também possui uma aba de "Pendências" que analisa se existem plugins QGIS ou bibliotecas Python ausentes e oferece a instalação automática.
+version=1.0.0
+author=Antigravity
+email=antigravity@gemini.ai
+repository=https://github.com/KuriakinToscan/BackupQgis
+category=Plugins
+tags=backup,sincronização,plugins,configurações,qsettings
+experimental=False
+icon=icon.png
