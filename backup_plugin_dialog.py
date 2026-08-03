@@ -832,7 +832,7 @@ class BackupPluginDialog(QDialog):
         
         backup_json = {
             'generator': 'QGIS Plugin Sync',
-            'version': '1.0.0',
+            'version': '0.1',
             'date': QDateTime.currentDateTime().toString('yyyy-MM-dd HH:mm:ss'),
             'repositories': repositories,
             'plugins': selected_plugins,
