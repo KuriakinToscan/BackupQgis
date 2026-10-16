@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 
 from conftest import FakeSettings
-from core.plugins import scan_installed_plugins, collect_plugin_settings, setting_belongs_to_plugins
+from core.plugins import (scan_installed_plugins, collect_plugin_settings,
+                          setting_belongs_to_plugin, setting_belongs_to_plugins)
 
 
 def make_plugin(base, folder, metadata):
@@ -56,3 +57,24 @@ def test_setting_belongs_to_plugins():
     assert setting_belongs_to_plugins('PythonPlugins/myplug', ['myplug'])
     assert setting_belongs_to_plugins('myplug/option', ['outro', 'myplug'])
     assert not setting_belongs_to_plugins('outro/option', ['myplug'])
+
+
+def test_activation_key_must_match_exactly():
+    # B5: 'foo' não pode capturar a chave de ativação de 'foobar'
+    assert setting_belongs_to_plugin('PythonPlugins/foo', 'foo')
+    assert not setting_belongs_to_plugin('PythonPlugins/foobar', 'foo')
+
+
+def test_everything_exported_is_restored():
+    # B4: tudo o que a exportação coleta precisa ser aceito na restauração
+    settings = FakeSettings({
+        'PythonPlugins/myplug': 'true',
+        'plugins/myplug/token': 'abc',
+        '/plugins/myplug/x': 1,
+        'MyPlug/Other': 'x',
+        'Plugin_myplug/y': 2,
+        'myplug/option': 1,
+    })
+    collected = collect_plugin_settings(settings, 'myplug')
+    assert len(collected) == 6
+    assert all(setting_belongs_to_plugins(key, ['myplug']) for key in collected)

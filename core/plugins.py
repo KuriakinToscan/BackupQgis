@@ -65,45 +65,50 @@ def scan_installed_plugins(paths, settings, warn=None):
     return plugins_list
 
 
+def plugin_setting_prefixes(plugin_key):
+    """
+    Prefixos (em minúsculas) usados por plugins para guardar configurações no QSettings.
+    """
+    k = plugin_key.lower()
+    return (
+        f"{k}/",
+        f"/{k}/",
+        f"plugins/{k}/",
+        f"/plugins/{k}/",
+        f"plugin_{k}/",
+    )
+
+
+def setting_belongs_to_plugin(key, plugin_key):
+    """
+    Indica se uma chave do QSettings pertence ao plugin.
+
+    É a única regra usada tanto na exportação quanto na restauração.
+    A comparação ignora maiúsculas/minúsculas; a chave de ativação precisa
+    ser exata, para que 'foo' não capture 'PythonPlugins/foobar'.
+    """
+    if key == activation_key(plugin_key):
+        return True
+    return key.lower().startswith(plugin_setting_prefixes(plugin_key))
+
+
+def setting_belongs_to_plugins(key, plugin_keys):
+    """
+    Indica se uma chave pertence a algum dos plugins informados.
+    """
+    return any(setting_belongs_to_plugin(key, plugin_key) for plugin_key in plugin_keys)
+
+
 def collect_plugin_settings(settings, plugin_key):
     """
     Vasculha o QSettings em busca de configurações associadas à chave do plugin.
     Retorna {chave: valor serializado}.
     """
-    plugin_settings = {}
-
     act_key = activation_key(plugin_key)
-    plugin_settings[act_key] = serialize_value(settings.value(act_key))
-
-    prefixes = [
-        f"{plugin_key}/",
-        f"/{plugin_key}/",
-        f"plugins/{plugin_key}/",
-        f"/plugins/{plugin_key}/",
-        f"plugin_{plugin_key}/",
-        f"Plugin_{plugin_key}/"
-    ]
+    plugin_settings = {act_key: serialize_value(settings.value(act_key))}
 
     for key in settings.allKeys():
-        key_lower = key.lower()
-        match = False
-        for prefix in prefixes:
-            if key_lower.startswith(prefix.lower()):
-                match = True
-                break
-        if match:
+        if setting_belongs_to_plugin(key, plugin_key):
             plugin_settings[key] = serialize_value(settings.value(key))
 
     return plugin_settings
-
-
-def setting_belongs_to_plugins(key, plugin_keys):
-    """
-    Indica se uma chave salva no backup pertence a algum dos plugins informados.
-    """
-    for sel_key in plugin_keys:
-        if (key.startswith(f"PythonPlugins/{sel_key}") or key.startswith(f"{sel_key}/")
-                or key.startswith(f"/{sel_key}/") or key.startswith(f"plugin_{sel_key}/")
-                or key.startswith(f"Plugin_{sel_key}/")):
-            return True
-    return False
