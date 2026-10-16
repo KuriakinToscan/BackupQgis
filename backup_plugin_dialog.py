@@ -4,7 +4,6 @@ import os
 import sys
 import json
 import subprocess
-import configparser
 from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal, QDateTime, QSettings
 from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget,
                              QTableWidget, QTableWidgetItem, QPushButton, QLineEdit,
@@ -12,7 +11,9 @@ from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, 
                              QHeaderView, QMessageBox)
 from qgis.PyQt.QtGui import QFont, QColor
 
-from .core.serialization import serialize_value, deserialize_value
+from .core.serialization import deserialize_value
+from .core.plugins import scan_installed_plugins, collect_plugin_settings, setting_belongs_to_plugins
+from .core.connections import scan_server_connections, group_legacy_connections
 from .core.dependencies import DEP_QGIS, DEP_PYTHON, find_dependencies
 
 # Rótulos exibidos na tabela de pendências para cada tipo de dependência
@@ -420,114 +421,14 @@ class BackupPluginDialog(QDialog):
         Escaneia as pastas de plugins instalados e lê seus metadados.
         """
         import qgis.utils
-        plugins_list = []
-        
         paths = getattr(qgis.utils, 'plugin_paths', [])
-        
-        for path in paths:
-            if not os.path.exists(path):
-                continue
-            for folder in os.listdir(path):
-                folder_path = os.path.join(path, folder)
-                if not os.path.isdir(folder_path):
-                    continue
-                
-                if folder.startswith('__'):
-                    continue
-                
-                metadata_file = os.path.join(folder_path, 'metadata.txt')
-                if os.path.exists(metadata_file):
-                    try:
-                        config = configparser.ConfigParser()
-                        with open(metadata_file, 'r', encoding='utf-8', errors='ignore') as f:
-                            config.read_file(f)
-                        
-                        name = config.get('general', 'name', fallback=folder)
-                        version = config.get('general', 'version', fallback='Desconhecida')
-                        description = config.get('general', 'description', fallback='')
-                        
-                        settings = QSettings()
-                        is_active = settings.value(f"PythonPlugins/{folder}", False, type=bool)
-                        
-                        plugins_list.append({
-                            'key': folder,
-                            'name': name,
-                            'version': version,
-                            'description': description,
-                            'active': is_active,
-                            'path': folder_path
-                        })
-                    except Exception as e:
-                        self.log(f"Aviso ao ler metadados do plugin '{folder}': {str(e)}")
-                        
-        return plugins_list
+        return scan_installed_plugins(paths, QSettings(), warn=self.log)
 
     def scan_server_connections(self):
         """
         Escaneia o QSettings e agrupa conexões individuais por tipo de provedor e nome.
         """
-        settings = QSettings()
-        connections_map = {}
-        
-        provider_labels = {
-            'wms': 'WMS / WMTS',
-            'wfs': 'WFS / OGC API',
-            'wcs': 'WCS',
-            'xyz': 'XYZ Tiles',
-            'vectortiles': 'Vector Tiles',
-            'stac': 'STAC Catalog',
-            'arcgis-mapserver': 'ArcGIS MapServer',
-            'arcgis-featureserver': 'ArcGIS FeatureServer',
-            'postgis': 'PostGIS',
-            'spatialite': 'SpatiaLite',
-            'oracle': 'Oracle',
-            'hana': 'SAP HANA',
-            'mssql': 'MS SQL Server'
-        }
-
-        for key in settings.allKeys():
-            parts = key.split('/')
-            provider_type = None
-            conn_name = None
-            
-            for p_idx, part in enumerate(parts):
-                if part.lower().startswith('connections-'):
-                    raw_type = part.lower().replace('connections-', '')
-                    provider_type = provider_labels.get(raw_type, raw_type.upper())
-                    if p_idx + 1 < len(parts):
-                        conn_name = parts[p_idx + 1]
-                    break
-                elif part.lower() in ['wms', 'wfs', 'wcs', 'xyz', 'stac', 'vectortiles'] and p_idx > 0 and parts[p_idx-1].lower() in ['qgis', 'plugins']:
-                    provider_type = provider_labels.get(part.lower(), part.upper())
-                    if p_idx + 1 < len(parts):
-                        conn_name = parts[p_idx + 1]
-                    break
-            
-            if not provider_type and len(parts) >= 2:
-                first_lower = parts[0].lower()
-                if 'stac' in first_lower:
-                    provider_type = 'STAC Catalog'
-                    conn_name = parts[1] if len(parts) > 1 else parts[0]
-            
-            if provider_type and conn_name and conn_name.strip():
-                map_key = (provider_type, conn_name)
-                if map_key not in connections_map:
-                    connections_map[map_key] = {
-                        'id': f"{provider_type}::{conn_name}",
-                        'provider_type': provider_type,
-                        'name': conn_name,
-                        'details': '',
-                        'keys': {}
-                    }
-                
-                serialized_val = serialize_value(settings.value(key))
-                connections_map[map_key]['keys'][key] = serialized_val
-                
-                key_end = parts[-1].lower()
-                if key_end in ['url', 'host', 'sqlitepath', 'database', 'dbname'] and not connections_map[map_key]['details']:
-                    connections_map[map_key]['details'] = str(settings.value(key))
-
-        return list(connections_map.values())
+        return scan_server_connections(QSettings())
 
     def refresh_export_table(self):
         """
@@ -648,33 +549,7 @@ class BackupPluginDialog(QDialog):
         """
         Vasculha o QSettings em busca de configurações associadas à chave do plugin.
         """
-        settings = QSettings()
-        plugin_settings = {}
-        
-        activation_key = f"PythonPlugins/{plugin_key}"
-        plugin_settings[activation_key] = serialize_value(settings.value(activation_key))
-        
-        prefixes = [
-            f"{plugin_key}/",
-            f"/{plugin_key}/",
-            f"plugins/{plugin_key}/",
-            f"/plugins/{plugin_key}/",
-            f"plugin_{plugin_key}/",
-            f"Plugin_{plugin_key}/"
-        ]
-        
-        for key in settings.allKeys():
-            key_lower = key.lower()
-            match = False
-            for prefix in prefixes:
-                if key_lower.startswith(prefix.lower()):
-                    match = True
-                    break
-            if match:
-                val = settings.value(key)
-                plugin_settings[key] = serialize_value(val)
-                
-        return plugin_settings
+        return collect_plugin_settings(QSettings(), plugin_key)
 
     def export_backup(self):
         """
@@ -847,17 +722,7 @@ class BackupPluginDialog(QDialog):
         providers_in_backup = self.backup_data.get('providers', [])
         
         if not providers_in_backup and 'server_connections' in self.backup_data:
-            s_conns = self.backup_data['server_connections']
-            temp_map = {}
-            for key, val_ser in s_conns.items():
-                parts = key.split('/')
-                p_type = parts[0] if len(parts) > 0 else 'Servidor'
-                c_name = parts[1] if len(parts) > 1 else 'Conexão'
-                m_key = (p_type, c_name)
-                if m_key not in temp_map:
-                    temp_map[m_key] = {'provider_type': p_type, 'name': c_name, 'details': '', 'keys': []}
-                temp_map[m_key]['keys'].append(key)
-            providers_in_backup = list(temp_map.values())
+            providers_in_backup = group_legacy_connections(self.backup_data['server_connections'])
 
         for row, prov in enumerate(providers_in_backup):
             self.import_providers_table.insertRow(row)
@@ -915,13 +780,7 @@ class BackupPluginDialog(QDialog):
         if 'settings' in self.backup_data and configs_to_restore_keys:
             self.log("Restaurando configurações dos plugins selecionados...")
             for key, val_serialized in self.backup_data['settings'].items():
-                belongs_to_selected = False
-                for sel_key in configs_to_restore_keys:
-                    if key.startswith(f"PythonPlugins/{sel_key}") or key.startswith(f"{sel_key}/") or key.startswith(f"/{sel_key}/") or key.startswith(f"plugin_{sel_key}/") or key.startswith(f"Plugin_{sel_key}/"):
-                        belongs_to_selected = True
-                        break
-                
-                if belongs_to_selected:
+                if setting_belongs_to_plugins(key, configs_to_restore_keys):
                     value = deserialize_value(val_serialized)
                     q_settings.setValue(key, value)
                     restored_settings_count += 1
