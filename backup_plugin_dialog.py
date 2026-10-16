@@ -4,7 +4,6 @@ import os
 import sys
 import json
 import subprocess
-import importlib
 import configparser
 from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal, QDateTime, QSettings
 from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget,
@@ -14,26 +13,10 @@ from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, 
 from qgis.PyQt.QtGui import QFont, QColor
 
 from .core.serialization import serialize_value, deserialize_value
+from .core.dependencies import DEP_QGIS, DEP_PYTHON, find_dependencies
 
-# Mapeamento comum de pacotes PyPI para nomes de importação Python
-IMPORT_MAP = {
-    'beautifulsoup4': 'bs4',
-    'scikit-learn': 'sklearn',
-    'pillow': 'PIL',
-    'pyyaml': 'yaml',
-    'pyshp': 'shapefile',
-    'python-dateutil': 'dateutil',
-    'ruamel.yaml': 'ruamel',
-    'opencv-python': 'cv2',
-    'pyjwt': 'jwt',
-    'sqlalchemy': 'sqlalchemy',
-    'matplotlib': 'matplotlib',
-    'numpy': 'numpy',
-    'pandas': 'pandas',
-    'scipy': 'scipy',
-    'osgeo': 'osgeo',
-    'psycopg2-binary': 'psycopg2'
-}
+# Rótulos exibidos na tabela de pendências para cada tipo de dependência
+DEP_LABELS = {DEP_QGIS: 'Plugin QGIS', DEP_PYTHON: 'Pacote Python'}
 
 # ==============================================================================
 # Worker assíncrono para instalação e correção de dependências
@@ -996,66 +979,6 @@ class BackupPluginDialog(QDialog):
     # Lógica da Aba "Verificar Pendências"
     # ==============================================================================
     
-    def extract_plugin_dependencies(self, plugin_dir):
-        """
-        Lê dependências QGIS e Python declaradas em metadata.txt e requirements.txt.
-        """
-        deps = {'qgis': [], 'python': []}
-        
-        # 1. Analisa metadata.txt
-        metadata_file = os.path.join(plugin_dir, 'metadata.txt')
-        if os.path.exists(metadata_file):
-            try:
-                config = configparser.ConfigParser()
-                with open(metadata_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    config.read_file(f)
-                
-                # Dependências QGIS
-                qgis_deps_str = config.get('general', 'plugin_dependencies', fallback='')
-                if qgis_deps_str:
-                    # Limpa e divide por vírgula
-                    for p in qgis_deps_str.split(','):
-                        p = p.strip()
-                        # Trata possíveis versionamentos ex: MyPlugin==1.2
-                        p_key = p.split('==')[0].split('>=')[0].split('<=')[0].strip()
-                        if p_key:
-                            deps['qgis'].append(p_key)
-                            
-                # Dependências Python nos metadados (customizadas)
-                for field in ['python_dependencies', 'pythondependencies', 'pip_dependencies', 'python_packages']:
-                    py_deps_str = config.get('general', field, fallback='')
-                    if py_deps_str:
-                        for pkg in py_deps_str.split(','):
-                            pkg = pkg.strip()
-                            if pkg:
-                                # Remove versioning specifiers e.g. requests>=2.20 -> requests
-                                clean_pkg = pkg.split('==')[0].split('>=')[0].split('<=')[0].split('>')[0].split('<')[0].split(' ')[0].strip()
-                                if clean_pkg:
-                                    deps['python'].append(clean_pkg)
-            except Exception as e:
-                pass
-
-        # 2. Analisa requirements.txt
-        reqs_file = os.path.join(plugin_dir, 'requirements.txt')
-        if os.path.exists(reqs_file):
-            try:
-                with open(reqs_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith('#'):
-                            continue
-                        # Ignora versionamento
-                        pkg = line.split('==')[0].split('>=')[0].split('<=')[0].split('>')[0].split('<')[0].split(' ')[0].strip()
-                        if pkg:
-                            deps['python'].append(pkg)
-            except Exception as e:
-                pass
-                
-        # Remove duplicados
-        deps['qgis'] = list(set(deps['qgis']))
-        deps['python'] = list(set(deps['python']))
-        return deps
-
     def check_dependencies(self):
         """
         Faz a varredura e lista dependências ausentes de todos os plugins locais ativos.
@@ -1066,45 +989,7 @@ class BackupPluginDialog(QDialog):
         local_plugins = self.scan_installed_plugins()
         local_keys = [p['key'] for p in local_plugins]
         
-        dependencies_found = []
-        
-        for plugin in local_plugins:
-            # Analisa apenas dependências de plugins que estão ativos
-            if not plugin['active']:
-                continue
-                
-            p_deps = self.extract_plugin_dependencies(plugin['path'])
-            
-            # Verifica dependências de plugins QGIS
-            for qgis_dep in p_deps['qgis']:
-                is_installed = qgis_dep in local_keys
-                dependencies_found.append({
-                    'source': plugin['name'],
-                    'type': 'Plugin QGIS',
-                    'name': qgis_dep,
-                    'status': 'Instalado' if is_installed else 'Ausente',
-                    'is_missing': not is_installed
-                })
-                
-            # Verifica dependências de pacotes Python
-            for py_dep in p_deps['python']:
-                # Mapeia para o nome de importação correspondente
-                import_name = IMPORT_MAP.get(py_dep.lower(), py_dep)
-                
-                is_installed = False
-                try:
-                    importlib.import_module(import_name)
-                    is_installed = True
-                except Exception:
-                    pass
-                
-                dependencies_found.append({
-                    'source': plugin['name'],
-                    'type': 'Pacote Python',
-                    'name': py_dep,
-                    'status': 'Instalado' if is_installed else 'Ausente',
-                    'is_missing': not is_installed
-                })
+        dependencies_found = find_dependencies(local_plugins, local_keys)
                 
         # Atualiza a tabela
         for row, dep in enumerate(dependencies_found):
@@ -1114,13 +999,13 @@ class BackupPluginDialog(QDialog):
             self.deps_table.setItem(row, 0, QTableWidgetItem(dep['source']))
             
             # Tipo
-            self.deps_table.setItem(row, 1, QTableWidgetItem(dep['type']))
+            self.deps_table.setItem(row, 1, QTableWidgetItem(DEP_LABELS[dep['kind']]))
             
             # Nome da dependência
             self.deps_table.setItem(row, 2, QTableWidgetItem(dep['name']))
             
             # Status
-            status_item = QTableWidgetItem(dep['status'])
+            status_item = QTableWidgetItem('Ausente' if dep['is_missing'] else 'Instalado')
             if dep['is_missing']:
                 status_item.setForeground(QColor("#D84315")) # Vermelho/Laranja escuro
             else:
@@ -1146,9 +1031,9 @@ class BackupPluginDialog(QDialog):
                 dep_type = self.deps_table.item(row, 1).text()
                 dep_name = self.deps_table.item(row, 2).text()
                 
-                if dep_type == 'Plugin QGIS':
+                if dep_type == DEP_LABELS[DEP_QGIS]:
                     missing_qgis.append(dep_name)
-                elif dep_type == 'Pacote Python':
+                elif dep_type == DEP_LABELS[DEP_PYTHON]:
                     missing_python.append(dep_name)
                     
         # Remove duplicados
