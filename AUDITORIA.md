@@ -204,3 +204,24 @@ Além disso, `plugin_dependencies` no `metadata.txt` lista **nomes** de plugins 
 ## 8. Resumo
 
 A ideia e a interface são boas, mas hoje **três das funções anunciadas não funcionam de forma confiável**: restauração de repositórios (B3), restauração de boa parte das configurações (B4) e correção de pacotes Python fora do Linux (B1); a instalação de plugins roda numa thread onde o QGIS não suporta (B2). Além disso o backup **expõe senhas** (S1) e um backup de terceiros pode **instalar e ativar código** (S2). Recomenda-se tratar a Fase 1 antes de qualquer publicação no repositório oficial do QGIS.
+
+---
+
+## 9. Andamento
+
+Modularização (etapas 1–4) concluída na branch `claude/serene-lamport-6qe2lz`:
+
+| Módulo | Conteúdo |
+|---|---|
+| `core/serialization.py` | `serialize_value` / `deserialize_value` |
+| `core/dependencies.py` | leitura de `metadata.txt`/`requirements.txt` e verificação de pendências |
+| `core/plugins.py` | varredura de plugins e regra única de chaves por plugin |
+| `core/connections.py` | varredura de conexões de provedores |
+| `core/backup.py` | montar, ler, validar e restaurar o JSON |
+
+- **B4 corrigido** (configurações em `plugins/<chave>/` voltam a ser restauradas; comparação sem diferenciar maiúsculas).
+- **B5 parcialmente corrigido** (chave de ativação exata). Falta tratar plugins core (`processing` etc.).
+- **Novo achado, corrigido:** backups antigos sem a lista `providers` exibiam as conexões mas não restauravam nenhuma.
+- Testes: `pip install -r requirements-dev.txt` e `QT_QPA_PLATFORM=offscreen python -m pytest tests` (47 testes, incluindo um fluxo exportar → carregar → restaurar pelo diálogo).
+
+Próximas etapas: divisão da UI (`ui/`), worker de instalação (`tasks/`), CI, e as correções de segurança S1/S2.
