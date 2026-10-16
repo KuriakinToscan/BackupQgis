@@ -2,7 +2,6 @@
 
 import os
 import sys
-import json
 import subprocess
 from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal, QDateTime, QSettings
 from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget,
@@ -11,9 +10,9 @@ from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, 
                              QHeaderView, QMessageBox)
 from qgis.PyQt.QtGui import QFont, QColor
 
-from .core.serialization import deserialize_value
-from .core.plugins import scan_installed_plugins, collect_plugin_settings, setting_belongs_to_plugins
-from .core.connections import scan_server_connections, group_legacy_connections
+from .core import plugins as core_plugins
+from .core import connections as core_connections
+from .core import backup as core_backup
 from .core.dependencies import DEP_QGIS, DEP_PYTHON, find_dependencies
 
 # Rótulos exibidos na tabela de pendências para cada tipo de dependência
@@ -422,13 +421,13 @@ class BackupPluginDialog(QDialog):
         """
         import qgis.utils
         paths = getattr(qgis.utils, 'plugin_paths', [])
-        return scan_installed_plugins(paths, QSettings(), warn=self.log)
+        return core_plugins.scan_installed_plugins(paths, QSettings(), warn=self.log)
 
     def scan_server_connections(self):
         """
         Escaneia o QSettings e agrupa conexões individuais por tipo de provedor e nome.
         """
-        return scan_server_connections(QSettings())
+        return core_connections.scan_server_connections(QSettings())
 
     def refresh_export_table(self):
         """
@@ -545,12 +544,6 @@ class BackupPluginDialog(QDialog):
             if not self.import_providers_table.isRowHidden(row):
                 self.import_providers_table.item(row, 0).setCheckState(state)
 
-    def collect_plugin_settings(self, plugin_key):
-        """
-        Vasculha o QSettings em busca de configurações associadas à chave do plugin.
-        """
-        return collect_plugin_settings(QSettings(), plugin_key)
-
     def export_backup(self):
         """
         Exporta a lista de plugins, configurações e provedores selecionados granularmente para um arquivo JSON.
@@ -563,80 +556,41 @@ class BackupPluginDialog(QDialog):
             
         self.log(f"Exportando backup para: {filepath}...")
         
-        selected_plugins = []
-        settings_to_backup = {}
-        
-        # 1. Processa tabela de plugins e configurações
+        # 1. Seleção da tabela de plugins e configurações
+        plugin_keys = []
+        config_plugin_keys = []
         for row in range(self.export_table.rowCount()):
-            chk_p = self.export_table.item(row, 0)
-            chk_c = self.export_table.item(row, 1)
-            
-            if chk_p.checkState() == Qt.Checked or chk_c.checkState() == Qt.Checked:
-                plugin_key = self.export_table.item(row, 3).text()
-                
-                plugin_data = None
-                for p in self.plugins_cache:
-                    if p['key'] == plugin_key:
-                        plugin_data = p
-                        break
-                        
-                if plugin_data and chk_p.checkState() == Qt.Checked:
-                    selected_plugins.append({
-                        'key': plugin_data['key'],
-                        'name': plugin_data['name'],
-                        'version': plugin_data['version'],
-                        'active': plugin_data['active']
-                    })
-                    
-                if plugin_key and chk_c.checkState() == Qt.Checked:
-                    p_settings = self.collect_plugin_settings(plugin_key)
-                    settings_to_backup.update(p_settings)
+            plugin_key = self.export_table.item(row, 3).text()
+            if self.export_table.item(row, 0).checkState() == Qt.Checked:
+                plugin_keys.append(plugin_key)
+            if self.export_table.item(row, 1).checkState() == Qt.Checked:
+                config_plugin_keys.append(plugin_key)
 
-        # 2. Processa tabela de provedores de conteúdo / conexões
-        server_connections_to_backup = {}
-        exported_providers_list = []
-        
+        # 2. Seleção da tabela de provedores de conteúdo / conexões
+        provider_ids = []
         for row in range(self.export_providers_table.rowCount()):
-            chk_prov = self.export_providers_table.item(row, 0)
-            if chk_prov.checkState() == Qt.Checked:
-                p_type = self.export_providers_table.item(row, 1).text()
-                p_name = self.export_providers_table.item(row, 2).text()
-                
-                for prov in self.providers_cache:
-                    if prov['provider_type'] == p_type and prov['name'] == p_name:
-                        server_connections_to_backup.update(prov['keys'])
-                        exported_providers_list.append({
-                            'provider_type': prov['provider_type'],
-                            'name': prov['name'],
-                            'details': prov['details'],
-                            'keys': list(prov['keys'].keys())
-                        })
-                        break
+            if self.export_providers_table.item(row, 0).checkState() == Qt.Checked:
+                provider_ids.append((self.export_providers_table.item(row, 1).text(),
+                                     self.export_providers_table.item(row, 2).text()))
 
-        q_settings = QSettings()
-        repositories = q_settings.value("pythonPlugins/pluginRepositories", {})
-        
-        backup_json = {
-            'generator': 'QGIS Plugin Sync',
-            'version': '0.1',
-            'date': QDateTime.currentDateTime().toString('yyyy-MM-dd HH:mm:ss'),
-            'repositories': repositories,
-            'plugins': selected_plugins,
-            'settings': settings_to_backup,
-            'server_connections': server_connections_to_backup,
-            'providers': exported_providers_list
-        }
+        backup_json = core_backup.build_backup(
+            QSettings(), self.plugins_cache, plugin_keys, config_plugin_keys,
+            self.providers_cache, provider_ids,
+            QDateTime.currentDateTime().toString('yyyy-MM-dd HH:mm:ss')
+        )
+        n_plugins = len(backup_json['plugins'])
+        n_settings = len(backup_json['settings'])
+        n_providers = len(backup_json['providers'])
         
         try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(backup_json, f, indent=4, ensure_ascii=False)
+            core_backup.write_backup(filepath, backup_json)
             
             msg = (f"Backup concluído com sucesso!\n\n"
-                   f"• Plugins exportados: {len(selected_plugins)}\n"
-                   f"• Configurações de plugins: {len(settings_to_backup)}\n"
-                   f"• Provedores de conteúdo (servidores/DBs): {len(exported_providers_list)}")
+                   f"• Plugins exportados: {n_plugins}\n"
+                   f"• Configurações de plugins: {n_settings}\n"
+                   f"• Provedores de conteúdo (servidores/DBs): {n_providers}")
             
-            self.log(f"Backup concluído! {len(selected_plugins)} plugins, {len(settings_to_backup)} configs e {len(exported_providers_list)} provedores exportados.")
+            self.log(f"Backup concluído! {n_plugins} plugins, {n_settings} configs e {n_providers} provedores exportados.")
             QMessageBox.information(self, "Backup Concluído", msg)
         except Exception as e:
             self.log(f"Erro ao salvar arquivo de backup: {str(e)}")
@@ -653,11 +607,7 @@ class BackupPluginDialog(QDialog):
             return
             
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                self.backup_data = json.load(f)
-                
-            if not isinstance(self.backup_data, dict) or ('plugins' not in self.backup_data and 'server_connections' not in self.backup_data):
-                raise ValueError("Arquivo de backup inválido ou incompatível.")
+            self.backup_data = core_backup.read_backup(filepath)
                 
             n_plugins = len(self.backup_data.get('plugins', []))
             n_provs = len(self.backup_data.get('providers', []))
@@ -719,12 +669,7 @@ class BackupPluginDialog(QDialog):
 
         # 2. Tabela de Provedores de Conteúdo no Backup
         self.import_providers_table.setRowCount(0)
-        providers_in_backup = self.backup_data.get('providers', [])
-        
-        if not providers_in_backup and 'server_connections' in self.backup_data:
-            providers_in_backup = group_legacy_connections(self.backup_data['server_connections'])
-
-        for row, prov in enumerate(providers_in_backup):
+        for row, prov in enumerate(core_backup.backup_providers(self.backup_data)):
             self.import_providers_table.insertRow(row)
             
             chk_prov = QTableWidgetItem()
@@ -744,92 +689,42 @@ class BackupPluginDialog(QDialog):
             QMessageBox.warning(self, "Aviso", "Por favor, carregue um arquivo de backup antes.")
             return
 
-        q_settings = QSettings()
-        
-        # 1. Adicionar repositórios customizados
-        backup_repos = self.backup_data.get('repositories', {})
-        if backup_repos:
-            self.log("Restaurando repositórios customizados...")
-            current_repos = q_settings.value("pythonPlugins/pluginRepositories", {}, type=dict)
-            current_repos.update(backup_repos)
-            q_settings.setValue("pythonPlugins/pluginRepositories", current_repos)
-
-        # 2. Processar seleção da tabela de plugins
-        plugins_to_install = []
-        plugins_to_enable = []
-        configs_to_restore_keys = []
-        
-        local_plugins = self.scan_installed_plugins()
-        local_keys = [p['key'] for p in local_plugins]
-        
+        # Seleção da tabela de plugins
+        plugin_keys = []
+        config_plugin_keys = []
         for row in range(self.import_table.rowCount()):
-            chk_p = self.import_table.item(row, 0)
-            chk_c = self.import_table.item(row, 1)
             key = self.import_table.item(row, 3).text()
-            
-            if chk_p.checkState() == Qt.Checked:
-                if key not in local_keys:
-                    plugins_to_install.append(key)
-                plugins_to_enable.append(key)
-                
-            if chk_c.checkState() == Qt.Checked:
-                configs_to_restore_keys.append(key)
+            if self.import_table.item(row, 0).checkState() == Qt.Checked:
+                plugin_keys.append(key)
+            if self.import_table.item(row, 1).checkState() == Qt.Checked:
+                config_plugin_keys.append(key)
 
-        # 3. Restaurar configurações dos plugins selecionados
-        restored_settings_count = 0
-        if 'settings' in self.backup_data and configs_to_restore_keys:
-            self.log("Restaurando configurações dos plugins selecionados...")
-            for key, val_serialized in self.backup_data['settings'].items():
-                if setting_belongs_to_plugins(key, configs_to_restore_keys):
-                    value = deserialize_value(val_serialized)
-                    q_settings.setValue(key, value)
-                    restored_settings_count += 1
-
-        # 4. Restaurar provedores de conteúdo selecionados
-        restored_prov_count = 0
-        server_conns = self.backup_data.get('server_connections', {})
-        providers_in_backup = self.backup_data.get('providers', [])
-        
-        selected_provider_keys = set()
+        # Seleção da tabela de provedores
+        provider_ids = []
         for row in range(self.import_providers_table.rowCount()):
-            chk_prov = self.import_providers_table.item(row, 0)
-            if chk_prov.checkState() == Qt.Checked:
-                p_type = self.import_providers_table.item(row, 1).text()
-                p_name = self.import_providers_table.item(row, 2).text()
-                
-                for prov in providers_in_backup:
-                    if prov.get('provider_type') == p_type and prov.get('name') == p_name:
-                        for k in prov.get('keys', []):
-                            selected_provider_keys.add(k)
-                        break
-                        
-        if selected_provider_keys and server_conns:
-            self.log(f"Restaurando {len(selected_provider_keys)} chaves de provedores de conteúdo...")
-            for key in selected_provider_keys:
-                if key in server_conns:
-                    value = deserialize_value(server_conns[key])
-                    q_settings.setValue(key, value)
-                    restored_prov_count += 1
-        elif server_conns and self.import_providers_table.rowCount() == 0:
-            for key, val_ser in server_conns.items():
-                q_settings.setValue(key, deserialize_value(val_ser))
-                restored_prov_count += 1
+            if self.import_providers_table.item(row, 0).checkState() == Qt.Checked:
+                provider_ids.append((self.import_providers_table.item(row, 1).text(),
+                                     self.import_providers_table.item(row, 2).text()))
 
-        # Ativa o estado de ativação para os plugins selecionados
-        for sel_key in plugins_to_enable:
-            q_settings.setValue(f"PythonPlugins/{sel_key}", True)
+        installed_keys = [p['key'] for p in self.scan_installed_plugins()]
+        result = core_backup.restore_backup(QSettings(), self.backup_data, plugin_keys, config_plugin_keys,
+                                            provider_ids, installed_keys, log=self.log)
 
-        # 5. Iniciar thread de instalação para plugins faltantes
-        if plugins_to_install:
-            self.log(f"Iniciando instalação assíncrona de {len(plugins_to_install)} plugins...")
-            self.run_dependency_worker(plugins_to_install, [])
+        n_enabled = len(result['plugins_enabled'])
+        n_settings = result['settings_restored']
+        n_providers = result['provider_keys_restored']
+
+        # Iniciar thread de instalação para plugins faltantes
+        if result['plugins_to_install']:
+            self.log(f"Iniciando instalação assíncrona de {len(result['plugins_to_install'])} plugins...")
+            self.run_dependency_worker(result['plugins_to_install'], [])
         else:
             msg = (f"Restauração concluída com sucesso!\n\n"
-                   f"• Plugins ativados: {len(plugins_to_enable)}\n"
-                   f"• Configurações de plugins restauradas: {restored_settings_count}\n"
-                   f"• Provedores de conteúdo restaurados: {restored_prov_count}")
+                   f"• Plugins ativados: {n_enabled}\n"
+                   f"• Configurações de plugins restauradas: {n_settings}\n"
+                   f"• Provedores de conteúdo restaurados: {n_providers}")
             
-            self.log(f"Restauração concluída! {len(plugins_to_enable)} plugins, {restored_settings_count} configs e {restored_prov_count} chaves de provedores restauradas.")
+            self.log(f"Restauração concluída! {n_enabled} plugins, {n_settings} configs e {n_providers} chaves de provedores restauradas.")
             self.refresh_import_table()
             self.refresh_export_table()
             QMessageBox.information(self, "Restauração Concluída", msg)
