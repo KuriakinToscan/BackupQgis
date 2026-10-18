@@ -57,6 +57,8 @@ Um JSON malicioso pode, portanto, gravar chaves arbitrárias no perfil (ex.: `Py
 
 **Proposta:** localizar o interpretador (`os.path.join(sys.exec_prefix, 'python.exe')` / `python3`), validar com `--version`, e cair para instruções manuais (OSGeo4W Shell) quando não encontrado. `--user` também falha em venv/conda — detectar `sys.prefix != sys.base_prefix`.
 
+Antes de chamar o pip, verificar se o destino da instalação tem permissão de escrita (`os.access(site.getusersitepackages(), os.W_OK)`, ou `sysconfig.get_paths()['purelib']` sem `--user`). Se não tiver, avisar o usuário e mostrar o comando para rodar no OSGeo4W Shell, em vez de deixar o pip falhar no meio. Não recomendar executar o QGIS como administrador: isso daria permissão total a todos os plugins carregados.
+
 ### 🔴 B2 — Instalador de plugins do QGIS chamado de dentro de uma `QThread`
 `pyplugin_installer` (`:141–157`) usa rede via `QgsNetworkAccessManager`, sinais da thread principal e **abre diálogos modais** durante `installPlugin`. Chamá-lo de uma thread secundária é comportamento indefinido no Qt (travamentos, crash, "QObject: Cannot create children for a parent that is in a different thread"). Além disso, `fetchAvailablePlugins` é assíncrono e não garante que a lista esteja carregada quando o laço começa.
 
@@ -163,7 +165,7 @@ Além disso, `plugin_dependencies` no `metadata.txt` lista **nomes** de plugins 
 ### Fase 1 — Correções urgentes (segurança e funcionamento)
 1. Excluir credenciais do export por padrão + opção explícita com aviso (S1).
 2. Pré-visualização/confirmação e whitelist de chaves no import (S2); confirmação antes do pip (S3).
-3. Corrigir o interpretador Python usado pelo pip (B1).
+3. Corrigir o interpretador Python usado pelo pip e checar antes a permissão de escrita da pasta de bibliotecas (B1).
 4. Tirar `pyplugin_installer` da thread secundária (B2).
 5. Usar `app/plugin_repositories` (B3).
 6. Unificar a regra de pertencimento de chaves a um plugin (B4, B5).
@@ -194,6 +196,7 @@ Além disso, `plugin_dependencies` no `metadata.txt` lista **nomes** de plugins 
 
 ### Ideias de funcionalidade (depois das fases acima)
 - Backup cifrado com senha, ou integração com `QgsAuthManager` para migrar credenciais com segurança.
+- Exportar e importar o backup direto da nuvem (GitHub Gist privado, Google Drive, WebDAV), com o token guardado no `QgsAuthManager`. **Pré-requisito:** S1 resolvida (credenciais fora do backup ou backup cifrado); caso contrário, o envio espalha as senhas. Nunca usar Gist público.
 - Incluir também: estilos (`symbology-style.db`), modelos/scripts do Processing, templates de layout, expressões personalizadas, atalhos.
 - Diff entre backup e máquina atual antes de restaurar.
 - Modo linha de comando (`qgis_process` ou script) para provisionar várias máquinas.
@@ -223,5 +226,7 @@ Modularização (etapas 1–4) concluída na branch `claude/serene-lamport-6qe2l
 - **B5 parcialmente corrigido** (chave de ativação exata). Falta tratar plugins core (`processing` etc.).
 - **Novo achado, corrigido:** backups antigos sem a lista `providers` exibiam as conexões mas não restauravam nenhuma.
 - Testes: `pip install -r requirements-dev.txt` e `QT_QPA_PLATFORM=offscreen python -m pytest tests` (47 testes, incluindo um fluxo exportar → carregar → restaurar pelo diálogo).
+
+Sugestões aproveitadas da análise feita no Jules (2026-10-18): checagem de permissão de escrita antes do pip (seção B1 e Fase 1, item 3) e backup em nuvem condicionado à S1 (Ideias de funcionalidade).
 
 Próximas etapas: divisão da UI (`ui/`), worker de instalação (`tasks/`), CI, e as correções de segurança S1/S2.
