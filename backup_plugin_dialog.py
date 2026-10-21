@@ -11,8 +11,9 @@ from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal, QByteArray, QDateTime, QDa
 from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget,
                              QTableWidget, QTableWidgetItem, QPushButton, QLineEdit,
                              QCheckBox, QLabel, QFileDialog, QProgressBar, QTextEdit,
-                             QHeaderView, QMessageBox)
-from qgis.PyQt.QtGui import QIcon, QFont, QColor
+                             QHeaderView, QMessageBox, QApplication)
+from qgis.PyQt.QtGui import QFont, QColor
+from qgis.core import QgsSettings, QgsApplication
 
 # Mapeamento comum de pacotes PyPI para nomes de importação Python
 IMPORT_MAP = {
@@ -33,6 +34,60 @@ IMPORT_MAP = {
     'osgeo': 'osgeo',
     'psycopg2-binary': 'psycopg2'
 }
+
+# Chaves de configuração que carregam credenciais e não são exportadas por padrão
+SECRET_SETTINGS_KEYS = {'password', 'pwd', 'pass', 'authcfg'}
+
+# Regras de descoberta de conexões por provedor: (prefixo no QSettings, rótulo exibido)
+PROVIDER_CONNECTION_RULES = [
+    ('connections-wms', 'WMS / WMTS'),
+    ('connections-wfs', 'WFS / OGC API'),
+    ('connections-wcs', 'WCS'),
+    ('connections-xyz', 'XYZ Tiles'),
+    ('connections-vectortiles', 'Vector Tiles'),
+    ('connections-stac', 'STAC Catalog'),
+    ('connections-arcgisfeatureserver', 'ArcGIS FeatureServer'),
+    ('connections-arcgismapserver', 'ArcGIS MapServer'),
+    ('connections-arcgisservice', 'ArcGIS Server'),
+    ('PostgreSQL/connections', 'PostGIS'),
+    ('SpatiaLite/connections', 'SpatiaLite'),
+    ('Oracle/connections', 'Oracle'),
+    ('MSSQL/connections', 'MS SQL Server'),
+    ('HANA/connections', 'SAP HANA'),
+    ('DB2/connections', 'DB2')
+]
+
+def is_secret_settings_key(key):
+    """
+    Indica se uma chave do QSettings carrega credencial (senha, authcfg etc.).
+    """
+    parts = key.split('/')
+    return bool(parts) and parts[-1].lower() in SECRET_SETTINGS_KEYS
+
+def settings_key_belongs_to_plugin(key, plugin_key):
+    """
+    Fonte única de verdade para associar uma chave do QSettings a um plugin,
+    usada tanto na exportação quanto na importação (case-insensitive, sem
+    vazar configurações de plugins cuja chave é prefixo de outra).
+    """
+    key_l = key.lower()
+    pk = plugin_key.lower()
+    if key_l == 'pythonplugins/' + pk:
+        return True
+    for prefix in (pk + '/', 'plugins/' + pk + '/', 'plugin_' + pk + '/'):
+        if key_l.startswith(prefix):
+            return True
+    return False
+
+def read_metadata_config(metadata_file):
+    """
+    Lê o metadata.txt de forma tolerante: sem interpolação (o parser padrão
+    quebra com '%'), aceitando opções duplicadas e BOM UTF-8.
+    """
+    config = configparser.ConfigParser(interpolation=None, strict=False)
+    with open(metadata_file, 'r', encoding='utf-8-sig', errors='ignore') as f:
+        config.read_file(f)
+    return config
 
 # ==============================================================================
 # Funções de Serialização e Deserialização para QSettings
@@ -108,106 +163,125 @@ def deserialize_value(data):
     return val
 
 # ==============================================================================
-# Worker assíncrono para instalação e correção de dependências
+# Worker assíncrono para instalação de pacotes Python via pip.
+# Operações do instalador de plugins do QGIS (pyplugin_installer) não rodam
+# aqui: elas carregam e ativam plugins e devem executar na thread principal.
 # ==============================================================================
 
-class DependencyFixerWorker(QThread):
+class PipInstallWorker(QThread):
     log_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int)
     finished_signal = pyqtSignal(bool, str)
-    
-    def __init__(self, qgis_plugins, python_packages):
-        super(DependencyFixerWorker, self).__init__()
-        self.qgis_plugins = qgis_plugins
-        self.python_packages = python_packages
+
+    def __init__(self, python_packages):
+        super(PipInstallWorker, self).__init__()
+        self.python_packages = list(python_packages)
         self._is_cancelled = False
+        self._process = None
 
     def cancel(self):
         self._is_cancelled = True
+        proc = self._process
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def _python_base_cmd(self):
+        """
+        Localiza o interpretador Python do QGIS. No Windows, sys.executable é o
+        binário do QGIS (ex.: qgis-ltr-bin.exe) e não serve para rodar pip.
+        """
+        if sys.platform.startswith('win'):
+            for base in (getattr(sys, 'base_prefix', ''), sys.prefix):
+                exe = os.path.join(base, 'python.exe')
+                if os.path.isfile(exe):
+                    return [exe]
+            exe_dir = os.path.dirname(sys.executable)
+            for bat_name in ('python-qgis-ltr.bat', 'python-qgis.bat'):
+                bat = os.path.join(exe_dir, bat_name)
+                if os.path.isfile(bat):
+                    return ['cmd', '/c', bat]
+            return [sys.executable]
+        return [sys.executable]
+
+    def _run_pip(self, base_cmd, package, extra_args):
+        cmd = base_cmd + ['-m', 'pip', 'install', '--no-input',
+                          '--disable-pip-version-check'] + extra_args + [package]
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            shell=False,
+            creationflags=creationflags
+        )
+        self._process = proc
+
+        for line in proc.stdout:
+            if self._is_cancelled:
+                break
+            if line.strip():
+                self.log_signal.emit(f"[pip] {line.strip()}")
+
+        if self._is_cancelled and proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        rc = proc.wait()
+        return rc == 0
 
     def run(self):
-        total_steps = len(self.qgis_plugins) + len(self.python_packages)
-        if total_steps == 0:
-            self.finished_signal.emit(True, "Nenhuma pendência para corrigir.")
-            return
+        try:
+            if not self.python_packages:
+                self.finished_signal.emit(True, "")
+                return
 
-        completed_steps = 0
-        self.progress_signal.emit(0)
-        
-        # 1. Instalar plugins do QGIS ausentes
-        if self.qgis_plugins:
-            self.log_signal.emit("=== Iniciando instalação de plugins do QGIS ===")
-            try:
-                import pyplugin_installer
-                installer = pyplugin_installer.instance()
-                self.log_signal.emit("Atualizando lista de repositórios de plugins do QGIS...")
-                installer.fetchAvailablePlugins(False)
-            except Exception as e:
-                self.log_signal.emit(f"Erro ao inicializar instalador do QGIS: {str(e)}")
-                installer = None
+            base_cmd = self._python_base_cmd()
+            if sys.platform.startswith('win') and base_cmd[0] == sys.executable:
+                self.log_signal.emit("Aviso: python.exe do QGIS não localizado; usando o executável atual (em instalações Windows isso pode abrir outra instância do QGIS).")
 
-            for plugin_key in self.qgis_plugins:
+            total = len(self.python_packages)
+            successes = 0
+
+            for i, package in enumerate(self.python_packages):
                 if self._is_cancelled:
-                    self.finished_signal.emit(False, "Operação cancelada pelo usuário.")
+                    self.finished_signal.emit(False, "Instalação de pacotes cancelada pelo usuário.")
                     return
-                
-                self.log_signal.emit(f"Instalando plugin do QGIS: {plugin_key}...")
-                if installer:
-                    try:
-                        success = installer.installPlugin(plugin_key)
-                        if success:
-                            self.log_signal.emit(f"Plugin '{plugin_key}' instalado com sucesso!")
-                        else:
-                            self.log_signal.emit(f"Falha ao instalar o plugin '{plugin_key}' (não encontrado ou erro de download).")
-                    except Exception as e:
-                        self.log_signal.emit(f"Erro durante instalação do plugin '{plugin_key}': {str(e)}")
-                else:
-                    self.log_signal.emit(f"Impossível instalar '{plugin_key}': Módulo pyplugin_installer indisponível.")
-                
-                completed_steps += 1
-                self.progress_signal.emit(int((completed_steps / total_steps) * 100))
 
-        # 2. Instalar pacotes Python ausentes via pip
-        if self.python_packages:
-            self.log_signal.emit("=== Iniciando instalação de pacotes Python ===")
-            python_exe = sys.executable
-            
-            for package in self.python_packages:
-                if self._is_cancelled:
-                    self.finished_signal.emit(False, "Operação cancelada pelo usuário.")
-                    return
-                
                 self.log_signal.emit(f"Instalando pacote Python via pip: {package}...")
-                cmd = [python_exe, "-m", "pip", "install", "--user", package]
-                
-                try:
-                    process = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        shell=False
-                    )
-                    
-                    while True:
-                        line = process.stdout.readline()
-                        if not line and process.poll() is not None:
-                            break
-                        if line:
-                            self.log_signal.emit(f"[pip] {line.strip()}")
-                            
-                    rc = process.poll()
-                    if rc == 0:
-                        self.log_signal.emit(f"Pacote Python '{package}' instalado com sucesso!")
-                    else:
-                        self.log_signal.emit(f"Erro ao instalar pacote '{package}'. Código de saída: {rc}")
-                except Exception as e:
-                    self.log_signal.emit(f"Erro ao executar pip para '{package}': {str(e)}")
-                
-                completed_steps += 1
-                self.progress_signal.emit(int((completed_steps / total_steps) * 100))
-                
-        self.finished_signal.emit(True, "Processo de correção concluído!")
+                ok = self._run_pip(base_cmd, package, [])
+                if self._is_cancelled:
+                    self.finished_signal.emit(False, "Instalação de pacotes cancelada pelo usuário.")
+                    return
+                if not ok:
+                    self.log_signal.emit("Tentando novamente com instalação no perfil do usuário (--user)...")
+                    ok = self._run_pip(base_cmd, package, ['--user'])
+
+                if ok:
+                    successes += 1
+                    self.log_signal.emit(f"Pacote Python '{package}' processado com sucesso!")
+                else:
+                    self.log_signal.emit(f"Erro ao instalar pacote '{package}'.")
+
+                self.progress_signal.emit(int((i + 1) / total * 100))
+
+            self.finished_signal.emit(True, f"Pacotes Python concluídos: {successes}/{total} com sucesso.")
+        except Exception as e:
+            self.finished_signal.emit(False, f"Erro inesperado durante o pip: {str(e)}")
 
 
 # ==============================================================================
@@ -223,6 +297,12 @@ class BackupPluginDialog(QDialog):
         self.backup_data = None
         self.plugins_cache = []
         self.providers_cache = []
+        self._busy = False
+        self._install_cancelled = False
+        self._install_queue = []
+        self._newly_installed = []
+        self._pending_restore_summary = None
+        self._force_close = False
         
         self.init_ui()
         self.refresh_export_table()
@@ -325,7 +405,15 @@ class BackupPluginDialog(QDialog):
         prov_filter_layout.addWidget(btn_sel_all_prov)
         prov_filter_layout.addWidget(btn_clear_prov)
         exp_prov_layout.addLayout(prov_filter_layout)
-        
+
+        secrets_layout = QHBoxLayout()
+        self.chk_include_secrets = QCheckBox("Incluir credenciais (senhas / authcfg) no arquivo de backup", self.subtab_exp_providers)
+        self.chk_include_secrets.setChecked(False)
+        self.chk_include_secrets.setToolTip("Desmarcado (recomendado): chaves de senha e authcfg não são gravadas no JSON.")
+        secrets_layout.addWidget(self.chk_include_secrets)
+        secrets_layout.addStretch()
+        exp_prov_layout.addLayout(secrets_layout)
+
         self.export_providers_table = QTableWidget(self.subtab_exp_providers)
         self.export_providers_table.setColumnCount(4)
         self.export_providers_table.setHorizontalHeaderLabels(["Exportar", "Tipo de Provedor", "Nome da Conexão", "URL / Endereço"])
@@ -488,11 +576,16 @@ class BackupPluginDialog(QDialog):
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
-        
+
+        self.btn_cancel = QPushButton("Cancelar", self)
+        self.btn_cancel.setVisible(False)
+        self.btn_cancel.clicked.connect(self.cancel_installation)
+
         btn_close = QPushButton("Fechar", self)
         btn_close.clicked.connect(self.close)
-        
+
         progress_close_layout.addWidget(self.progress_bar)
+        progress_close_layout.addWidget(self.btn_cancel)
         progress_close_layout.addWidget(btn_close)
         footer_layout.addLayout(progress_close_layout)
         
@@ -510,34 +603,36 @@ class BackupPluginDialog(QDialog):
         """
         import qgis.utils
         plugins_list = []
-        
+        seen_keys = set()
+
         paths = getattr(qgis.utils, 'plugin_paths', [])
-        
+
         for path in paths:
             if not os.path.exists(path):
                 continue
-            for folder in os.listdir(path):
+            for folder in sorted(os.listdir(path)):
                 folder_path = os.path.join(path, folder)
                 if not os.path.isdir(folder_path):
                     continue
-                
+
                 if folder.startswith('__'):
                     continue
-                
+
+                if folder in seen_keys:
+                    continue
+
                 metadata_file = os.path.join(folder_path, 'metadata.txt')
                 if os.path.exists(metadata_file):
                     try:
-                        config = configparser.ConfigParser()
-                        with open(metadata_file, 'r', encoding='utf-8', errors='ignore') as f:
-                            config.read_file(f)
-                        
+                        config = read_metadata_config(metadata_file)
+
                         name = config.get('general', 'name', fallback=folder)
                         version = config.get('general', 'version', fallback='Desconhecida')
                         description = config.get('general', 'description', fallback='')
-                        
+
                         settings = QSettings()
                         is_active = settings.value(f"PythonPlugins/{folder}", False, type=bool)
-                        
+
                         plugins_list.append({
                             'key': folder,
                             'name': name,
@@ -546,75 +641,77 @@ class BackupPluginDialog(QDialog):
                             'active': is_active,
                             'path': folder_path
                         })
+                        seen_keys.add(folder)
                     except Exception as e:
                         self.log(f"Aviso ao ler metadados do plugin '{folder}': {str(e)}")
-                        
+
+        plugins_list.sort(key=lambda p: p['name'].lower())
         return plugins_list
 
     def scan_server_connections(self):
         """
         Escaneia o QSettings e agrupa conexões individuais por tipo de provedor e nome.
+        Usa as regras de PROVIDER_CONNECTION_RULES, que cobrem tanto as conexões
+        raiz (connections-wms, connections-xyz, ...) quanto as de bancos de dados
+        (PostgreSQL/connections, SpatiaLite/connections, Oracle/connections, ...).
         """
         settings = QSettings()
         connections_map = {}
-        
-        provider_labels = {
-            'wms': 'WMS / WMTS',
-            'wfs': 'WFS / OGC API',
-            'wcs': 'WCS',
-            'xyz': 'XYZ Tiles',
-            'vectortiles': 'Vector Tiles',
-            'stac': 'STAC Catalog',
-            'arcgis-mapserver': 'ArcGIS MapServer',
-            'arcgis-featureserver': 'ArcGIS FeatureServer',
-            'postgis': 'PostGIS',
-            'spatialite': 'SpatiaLite',
-            'oracle': 'Oracle',
-            'hana': 'SAP HANA',
-            'mssql': 'MS SQL Server'
-        }
+
+        rules = [(prefix.lower(), label) for prefix, label in PROVIDER_CONNECTION_RULES]
+        detail_priority = ['url', 'host', 'sqlitepath', 'database', 'dbname']
 
         for key in settings.allKeys():
-            parts = key.split('/')
+            key_l = key.lower()
             provider_type = None
-            conn_name = None
-            
-            for p_idx, part in enumerate(parts):
-                if part.lower().startswith('connections-'):
-                    raw_type = part.lower().replace('connections-', '')
-                    provider_type = provider_labels.get(raw_type, raw_type.upper())
-                    if p_idx + 1 < len(parts):
-                        conn_name = parts[p_idx + 1]
+            name_idx = 0
+
+            for prefix, label in rules:
+                if key_l.startswith(prefix + '/'):
+                    provider_type = label
+                    name_idx = len(prefix.split('/'))
                     break
-                elif part.lower() in ['wms', 'wfs', 'wcs', 'xyz', 'stac', 'vectortiles'] and p_idx > 0 and parts[p_idx-1].lower() in ['qgis', 'plugins']:
-                    provider_type = provider_labels.get(part.lower(), part.upper())
-                    if p_idx + 1 < len(parts):
-                        conn_name = parts[p_idx + 1]
-                    break
-            
-            if not provider_type and len(parts) >= 2:
-                first_lower = parts[0].lower()
-                if 'stac' in first_lower:
+
+            if provider_type is None:
+                parts = key.split('/')
+                if len(parts) >= 2 and 'stac' in parts[0].lower():
                     provider_type = 'STAC Catalog'
-                    conn_name = parts[1] if len(parts) > 1 else parts[0]
-            
-            if provider_type and conn_name and conn_name.strip():
-                map_key = (provider_type, conn_name)
-                if map_key not in connections_map:
-                    connections_map[map_key] = {
-                        'id': f"{provider_type}::{conn_name}",
-                        'provider_type': provider_type,
-                        'name': conn_name,
-                        'details': '',
-                        'keys': {}
-                    }
-                
-                serialized_val = serialize_value(settings.value(key))
-                connections_map[map_key]['keys'][key] = serialized_val
-                
-                key_end = parts[-1].lower()
-                if key_end in ['url', 'host', 'sqlitepath', 'database', 'dbname'] and not connections_map[map_key]['details']:
-                    connections_map[map_key]['details'] = str(settings.value(key))
+                    name_idx = 2 if len(parts) >= 3 and parts[1].lower() == 'connections' else 1
+
+            if provider_type is None:
+                continue
+
+            parts = key.split('/')
+            if len(parts) <= name_idx:
+                continue
+            conn_name = parts[name_idx]
+            if not conn_name.strip():
+                continue
+
+            map_key = (provider_type, conn_name)
+            if map_key not in connections_map:
+                connections_map[map_key] = {
+                    'id': f"{provider_type}::{conn_name}",
+                    'provider_type': provider_type,
+                    'name': conn_name,
+                    'details': '',
+                    'keys': {},
+                    '_candidates': {}
+                }
+
+            entry = connections_map[map_key]
+            entry['keys'][key] = serialize_value(settings.value(key))
+
+            key_end = parts[-1].lower()
+            if key_end in detail_priority:
+                entry['_candidates'][key_end] = str(settings.value(key))
+
+        for entry in connections_map.values():
+            for field in detail_priority:
+                if entry['_candidates'].get(field):
+                    entry['details'] = entry['_candidates'][field]
+                    break
+            del entry['_candidates']
 
         return list(connections_map.values())
 
@@ -739,61 +836,123 @@ class BackupPluginDialog(QDialog):
         """
         settings = QSettings()
         plugin_settings = {}
-        
+
         activation_key = f"PythonPlugins/{plugin_key}"
-        plugin_settings[activation_key] = serialize_value(settings.value(activation_key))
-        
-        prefixes = [
-            f"{plugin_key}/",
-            f"/{plugin_key}/",
-            f"plugins/{plugin_key}/",
-            f"/plugins/{plugin_key}/",
-            f"plugin_{plugin_key}/",
-            f"Plugin_{plugin_key}/"
-        ]
-        
+        plugin_settings[activation_key] = serialize_value(settings.value(activation_key, False, type=bool))
+
         for key in settings.allKeys():
-            key_lower = key.lower()
-            match = False
-            for prefix in prefixes:
-                if key_lower.startswith(prefix.lower()):
-                    match = True
-                    break
-            if match:
-                val = settings.value(key)
-                plugin_settings[key] = serialize_value(val)
-                
+            if settings_key_belongs_to_plugin(key, plugin_key):
+                plugin_settings[key] = serialize_value(settings.value(key))
+
         return plugin_settings
+
+    def _read_plugin_repositories(self, include_secrets=True):
+        """
+        Lê os repositórios de plugins da chave usada pelo pyplugin_installer
+        (app/plugin_repositories), opcionalmente sem credenciais.
+        """
+        try:
+            repos = QgsSettings().value("app/plugin_repositories", {}, type=dict)
+        except Exception:
+            repos = {}
+        if not isinstance(repos, dict):
+            repos = {}
+        if not include_secrets and repos:
+            cleaned = {}
+            for repo_id, cfg in repos.items():
+                if isinstance(cfg, dict):
+                    cfg = {k: v for k, v in cfg.items()
+                           if str(k).lower() not in SECRET_SETTINGS_KEYS}
+                cleaned[repo_id] = cfg
+            return cleaned
+        return dict(repos)
+
+    def _is_plugin_installed(self, plugin_key):
+        """
+        Verifica se a pasta do plugin existe em algum dos caminhos de plugins do QGIS.
+        """
+        import qgis.utils
+        for path in getattr(qgis.utils, 'plugin_paths', []):
+            if os.path.isdir(os.path.join(path, plugin_key)):
+                return True
+        return False
+
+    def create_snapshot(self):
+        """
+        Salva um backup completo do estado atual (plugins, configurações e
+        provedores), usado como salvaguarda antes de uma restauração.
+        """
+        timestamp = QDateTime.currentDateTime().toString('yyyyMMdd_HHmmss')
+        base_dir = ''
+        try:
+            base_dir = QgsApplication.qgisSettingsDirPath()
+        except Exception:
+            pass
+        if not base_dir or not os.path.isdir(base_dir):
+            base_dir = os.path.expanduser('~')
+        filepath = os.path.join(base_dir, f"backup_qgis_snapshot_{timestamp}.json")
+
+        plugins_list = []
+        settings_to_backup = {}
+        for plugin in self.scan_installed_plugins():
+            plugins_list.append({
+                'key': plugin['key'],
+                'name': plugin['name'],
+                'version': plugin['version'],
+                'active': plugin['active']
+            })
+            settings_to_backup.update(self.collect_plugin_settings(plugin['key']))
+
+        server_connections = {}
+        providers_list = []
+        for prov in self.scan_server_connections():
+            server_connections.update(prov['keys'])
+            providers_list.append({
+                'provider_type': prov['provider_type'],
+                'name': prov['name'],
+                'details': prov['details'],
+                'keys': list(prov['keys'].keys())
+            })
+
+        backup_json = {
+            'generator': 'QGIS Plugin Sync',
+            'version': '0.1',
+            'date': QDateTime.currentDateTime().toString('yyyy-MM-dd HH:mm:ss'),
+            'snapshot': True,
+            'repositories': self._read_plugin_repositories(include_secrets=True),
+            'plugins': plugins_list,
+            'settings': settings_to_backup,
+            'server_connections': server_connections,
+            'providers': providers_list
+        }
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(backup_json, f, indent=4, ensure_ascii=False)
+        return filepath
 
     def export_backup(self):
         """
         Exporta a lista de plugins, configurações e provedores selecionados granularmente para um arquivo JSON.
         """
-        filepath, _ = QFileDialog.getSaveFileName(
-            self, "Salvar Backup de Plugins e Provedores", "", "Arquivos JSON (*.json)"
-        )
-        if not filepath:
-            return
-            
-        self.log(f"Exportando backup para: {filepath}...")
-        
+        include_secrets = self.chk_include_secrets.isChecked()
+
         selected_plugins = []
         settings_to_backup = {}
-        
+
         # 1. Processa tabela de plugins e configurações
         for row in range(self.export_table.rowCount()):
             chk_p = self.export_table.item(row, 0)
             chk_c = self.export_table.item(row, 1)
-            
+
             if chk_p.checkState() == Qt.Checked or chk_c.checkState() == Qt.Checked:
                 plugin_key = self.export_table.item(row, 3).text()
-                
+
                 plugin_data = None
                 for p in self.plugins_cache:
                     if p['key'] == plugin_key:
                         plugin_data = p
                         break
-                        
+
                 if plugin_data and chk_p.checkState() == Qt.Checked:
                     selected_plugins.append({
                         'key': plugin_data['key'],
@@ -801,7 +960,7 @@ class BackupPluginDialog(QDialog):
                         'version': plugin_data['version'],
                         'active': plugin_data['active']
                     })
-                    
+
                 if plugin_key and chk_c.checkState() == Qt.Checked:
                     p_settings = self.collect_plugin_settings(plugin_key)
                     settings_to_backup.update(p_settings)
@@ -809,27 +968,51 @@ class BackupPluginDialog(QDialog):
         # 2. Processa tabela de provedores de conteúdo / conexões
         server_connections_to_backup = {}
         exported_providers_list = []
-        
+        skipped_secret_count = 0
+
         for row in range(self.export_providers_table.rowCount()):
             chk_prov = self.export_providers_table.item(row, 0)
             if chk_prov.checkState() == Qt.Checked:
                 p_type = self.export_providers_table.item(row, 1).text()
                 p_name = self.export_providers_table.item(row, 2).text()
-                
+
                 for prov in self.providers_cache:
                     if prov['provider_type'] == p_type and prov['name'] == p_name:
-                        server_connections_to_backup.update(prov['keys'])
+                        exported_keys = {}
+                        for k, v in prov['keys'].items():
+                            if include_secrets or not is_secret_settings_key(k):
+                                exported_keys[k] = v
+                            else:
+                                skipped_secret_count += 1
+                        server_connections_to_backup.update(exported_keys)
                         exported_providers_list.append({
                             'provider_type': prov['provider_type'],
                             'name': prov['name'],
                             'details': prov['details'],
-                            'keys': list(prov['keys'].keys())
+                            'keys': list(exported_keys.keys())
                         })
                         break
 
-        q_settings = QSettings()
-        repositories = q_settings.value("pythonPlugins/pluginRepositories", {})
-        
+        if not selected_plugins and not settings_to_backup and not exported_providers_list:
+            QMessageBox.warning(self, "Aviso", "Nenhum item selecionado para exportar.")
+            return
+
+        default_name = os.path.join(
+            os.path.expanduser('~'),
+            f"backup_qgis_{QDateTime.currentDateTime().toString('yyyyMMdd_HHmmss')}.json"
+        )
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Salvar Backup de Plugins e Provedores", default_name, "Arquivos JSON (*.json)"
+        )
+        if not filepath:
+            return
+        if not filepath.lower().endswith('.json'):
+            filepath += '.json'
+
+        self.log(f"Exportando backup para: {filepath}...")
+
+        repositories = self._read_plugin_repositories(include_secrets)
+
         backup_json = {
             'generator': 'QGIS Plugin Sync',
             'version': '0.1',
@@ -840,16 +1023,22 @@ class BackupPluginDialog(QDialog):
             'server_connections': server_connections_to_backup,
             'providers': exported_providers_list
         }
-        
+
         try:
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(backup_json, f, indent=4, ensure_ascii=False)
-            
+
+            if include_secrets:
+                cred_msg = "• Credenciais incluídas: Sim — o arquivo contém senhas/authcfg; guarde-o em local seguro"
+            else:
+                cred_msg = f"• Credenciais incluídas: Não ({skipped_secret_count} chaves sensíveis ignoradas)"
+
             msg = (f"Backup concluído com sucesso!\n\n"
                    f"• Plugins exportados: {len(selected_plugins)}\n"
                    f"• Configurações de plugins: {len(settings_to_backup)}\n"
-                   f"• Provedores de conteúdo (servidores/DBs): {len(exported_providers_list)}")
-            
+                   f"• Provedores de conteúdo (servidores/DBs): {len(exported_providers_list)}\n"
+                   f"{cred_msg}")
+
             self.log(f"Backup concluído! {len(selected_plugins)} plugins, {len(settings_to_backup)} configs e {len(exported_providers_list)} provedores exportados.")
             QMessageBox.information(self, "Backup Concluído", msg)
         except Exception as e:
@@ -967,99 +1156,165 @@ class BackupPluginDialog(QDialog):
         if not self.backup_data:
             QMessageBox.warning(self, "Aviso", "Por favor, carregue um arquivo de backup antes.")
             return
+        if self._busy:
+            QMessageBox.information(self, "Sincronizador", "Aguarde a operação em andamento.")
+            return
 
-        q_settings = QSettings()
-        
-        # 1. Adicionar repositórios customizados
-        backup_repos = self.backup_data.get('repositories', {})
-        if backup_repos:
-            self.log("Restaurando repositórios customizados...")
-            current_repos = q_settings.value("pythonPlugins/pluginRepositories", {}, type=dict)
-            current_repos.update(backup_repos)
-            q_settings.setValue("pythonPlugins/pluginRepositories", current_repos)
-
-        # 2. Processar seleção da tabela de plugins
-        plugins_to_install = []
-        plugins_to_enable = []
-        configs_to_restore_keys = []
-        
+        # --- 1. Coleta da seleção (nenhuma gravação ainda) ---
         local_plugins = self.scan_installed_plugins()
         local_keys = [p['key'] for p in local_plugins]
-        
+
+        plugins_to_install = []
+        plugins_to_activate = []
+        configs_to_restore_keys = []
+
         for row in range(self.import_table.rowCount()):
             chk_p = self.import_table.item(row, 0)
             chk_c = self.import_table.item(row, 1)
             key = self.import_table.item(row, 3).text()
-            
+
             if chk_p.checkState() == Qt.Checked:
-                if key not in local_keys:
+                if key in local_keys:
+                    plugins_to_activate.append(key)
+                else:
                     plugins_to_install.append(key)
-                plugins_to_enable.append(key)
-                
+
             if chk_c.checkState() == Qt.Checked:
                 configs_to_restore_keys.append(key)
 
-        # 3. Restaurar configurações dos plugins selecionados
-        restored_settings_count = 0
-        if 'settings' in self.backup_data and configs_to_restore_keys:
-            self.log("Restaurando configurações dos plugins selecionados...")
-            for key, val_serialized in self.backup_data['settings'].items():
-                belongs_to_selected = False
-                for sel_key in configs_to_restore_keys:
-                    if key.startswith(f"PythonPlugins/{sel_key}") or key.startswith(f"{sel_key}/") or key.startswith(f"/{sel_key}/") or key.startswith(f"plugin_{sel_key}/") or key.startswith(f"Plugin_{sel_key}/"):
-                        belongs_to_selected = True
-                        break
-                
-                if belongs_to_selected:
-                    value = deserialize_value(val_serialized)
-                    q_settings.setValue(key, value)
-                    restored_settings_count += 1
+        backup_settings = self.backup_data.get('settings', {})
+        if not isinstance(backup_settings, dict):
+            backup_settings = {}
 
-        # 4. Restaurar provedores de conteúdo selecionados
-        restored_prov_count = 0
+        settings_entries = []
+        if backup_settings and configs_to_restore_keys:
+            for key, val_serialized in backup_settings.items():
+                for sel_key in configs_to_restore_keys:
+                    if settings_key_belongs_to_plugin(key, sel_key):
+                        settings_entries.append((key, val_serialized))
+                        break
+
         server_conns = self.backup_data.get('server_connections', {})
+        if not isinstance(server_conns, dict):
+            server_conns = {}
         providers_in_backup = self.backup_data.get('providers', [])
-        
+        if not isinstance(providers_in_backup, list):
+            providers_in_backup = []
+
         selected_provider_keys = set()
         for row in range(self.import_providers_table.rowCount()):
             chk_prov = self.import_providers_table.item(row, 0)
             if chk_prov.checkState() == Qt.Checked:
                 p_type = self.import_providers_table.item(row, 1).text()
                 p_name = self.import_providers_table.item(row, 2).text()
-                
+
                 for prov in providers_in_backup:
                     if prov.get('provider_type') == p_type and prov.get('name') == p_name:
                         for k in prov.get('keys', []):
                             selected_provider_keys.add(k)
                         break
-                        
-        if selected_provider_keys and server_conns:
+
+        if not selected_provider_keys and server_conns and self.import_providers_table.rowCount() == 0:
+            # Backups antigos, sem a lista estruturada de provedores
+            selected_provider_keys = set(server_conns.keys())
+
+        backup_repos = self.backup_data.get('repositories', {})
+        if not isinstance(backup_repos, dict):
+            backup_repos = {}
+
+        # --- 2. Confirmação com resumo e snapshot opcional ---
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(QMessageBox.Question)
+        msg_box.setWindowTitle("Confirmar restauração")
+        msg_box.setText(
+            f"Aplicar a restauração selecionada?\n\n"
+            f"• Plugins a ativar: {len(plugins_to_activate) + len(plugins_to_install)} "
+            f"(sendo {len(plugins_to_install)} a instalar)\n"
+            f"• Configurações de plugins: {len(settings_entries)} chaves\n"
+            f"• Provedores de conteúdo: {len(selected_provider_keys)} chaves\n"
+            f"• Repositórios de plugins: {len(backup_repos)}"
+        )
+        msg_box.setInformativeText(
+            "Configurações e conexões locais com o mesmo nome serão sobrescritas.\n"
+            "Plugins ativados passam a valer após reiniciar o QGIS."
+        )
+        snapshot_chk = QCheckBox("Salvar snapshot do estado atual antes de restaurar", msg_box)
+        snapshot_chk.setChecked(True)
+        msg_box.setCheckBox(snapshot_chk)
+        msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg_box.setDefaultButton(QMessageBox.Yes)
+        if msg_box.exec_() != QMessageBox.Yes:
+            self.log("Restauração cancelada pelo usuário.")
+            return
+
+        if snapshot_chk.isChecked():
+            try:
+                snapshot_path = self.create_snapshot()
+                self.log(f"Snapshot do estado atual salvo em: {snapshot_path}")
+            except Exception as e:
+                ret = QMessageBox.question(
+                    self, "Snapshot",
+                    f"Falha ao salvar o snapshot do estado atual:\n{str(e)}\n\n"
+                    f"Continuar a restauração mesmo assim?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if ret != QMessageBox.Yes:
+                    self.log("Restauração abortada: falha ao gerar o snapshot de segurança.")
+                    return
+
+        # --- 3. Aplicação ---
+        q_settings = QSettings()
+
+        if backup_repos:
+            self.log("Restaurando repositórios customizados (podem exigir reinício do QGIS)...")
+            try:
+                current_repos = QgsSettings().value("app/plugin_repositories", {}, type=dict)
+                if not isinstance(current_repos, dict):
+                    current_repos = {}
+                merged = dict(current_repos)
+                merged.update(backup_repos)
+                QgsSettings().setValue("app/plugin_repositories", merged)
+            except Exception as e:
+                self.log(f"Aviso ao restaurar repositórios: {str(e)}")
+
+        restored_settings_count = 0
+        if settings_entries:
+            self.log(f"Restaurando {len(settings_entries)} configurações de plugins...")
+            for key, val_serialized in settings_entries:
+                q_settings.setValue(key, deserialize_value(val_serialized))
+                restored_settings_count += 1
+
+        restored_prov_count = 0
+        if selected_provider_keys:
             self.log(f"Restaurando {len(selected_provider_keys)} chaves de provedores de conteúdo...")
             for key in selected_provider_keys:
                 if key in server_conns:
-                    value = deserialize_value(server_conns[key])
-                    q_settings.setValue(key, value)
+                    q_settings.setValue(key, deserialize_value(server_conns[key]))
                     restored_prov_count += 1
-        elif server_conns and self.import_providers_table.rowCount() == 0:
-            for key, val_ser in server_conns.items():
-                q_settings.setValue(key, deserialize_value(val_ser))
-                restored_prov_count += 1
 
-        # Ativa o estado de ativação para os plugins selecionados
-        for sel_key in plugins_to_enable:
-            q_settings.setValue(f"PythonPlugins/{sel_key}", True)
+        for key in plugins_to_activate:
+            q_settings.setValue(f"PythonPlugins/{key}", True)
 
-        # 5. Iniciar thread de instalação para plugins faltantes
+        q_settings.sync()
+
+        # --- 4. Instalação dos plugins ausentes (ativação só após sucesso) ---
         if plugins_to_install:
-            self.log(f"Iniciando instalação assíncrona de {len(plugins_to_install)} plugins...")
-            self.run_dependency_worker(plugins_to_install, [])
+            self._pending_restore_summary = {
+                'ativados': len(plugins_to_activate),
+                'a_instalar': len(plugins_to_install),
+                'configs': restored_settings_count,
+                'provedores': restored_prov_count
+            }
+            self.log(f"Restauração aplicada. Iniciando instalação de {len(plugins_to_install)} plugins ausentes...")
+            self.start_installation(plugins_to_install, [])
         else:
             msg = (f"Restauração concluída com sucesso!\n\n"
-                   f"• Plugins ativados: {len(plugins_to_enable)}\n"
+                   f"• Plugins ativados: {len(plugins_to_activate)}\n"
                    f"• Configurações de plugins restauradas: {restored_settings_count}\n"
-                   f"• Provedores de conteúdo restaurados: {restored_prov_count}")
-            
-            self.log(f"Restauração concluída! {len(plugins_to_enable)} plugins, {restored_settings_count} configs e {restored_prov_count} chaves de provedores restauradas.")
+                   f"• Provedores de conteúdo restaurados: {restored_prov_count}\n\n"
+                   f"Reinicie o QGIS para carregar os plugins ativados.")
+
+            self.log(f"Restauração concluída! {len(plugins_to_activate)} plugins, {restored_settings_count} configs e {restored_prov_count} chaves de provedores restauradas.")
             self.refresh_import_table()
             self.refresh_export_table()
             QMessageBox.information(self, "Restauração Concluída", msg)
@@ -1078,10 +1333,8 @@ class BackupPluginDialog(QDialog):
         metadata_file = os.path.join(plugin_dir, 'metadata.txt')
         if os.path.exists(metadata_file):
             try:
-                config = configparser.ConfigParser()
-                with open(metadata_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    config.read_file(f)
-                
+                config = read_metadata_config(metadata_file)
+
                 # Dependências QGIS
                 qgis_deps_str = config.get('general', 'plugin_dependencies', fallback='')
                 if qgis_deps_str:
@@ -1128,7 +1381,7 @@ class BackupPluginDialog(QDialog):
         deps['python'] = list(set(deps['python']))
         return deps
 
-    def check_dependencies(self):
+    def check_dependencies(self, interactive=True):
         """
         Faz a varredura e lista dependências ausentes de todos os plugins locais ativos.
         """
@@ -1202,7 +1455,7 @@ class BackupPluginDialog(QDialog):
         missing_count = sum(1 for d in dependencies_found if d['is_missing'])
         self.log(f"Verificação concluída! {missing_count} pendências críticas encontradas.")
         
-        if missing_count == 0:
+        if missing_count == 0 and interactive:
             QMessageBox.information(self, "Pendências", "Nenhuma pendência encontrada! Todos os plugins ativos possuem suas dependências.")
 
     def fix_dependencies(self):
@@ -1232,42 +1485,178 @@ class BackupPluginDialog(QDialog):
             return
             
         self.log(f"Iniciando correção automática de {len(missing_qgis)} plugins QGIS e {len(missing_python)} pacotes Python...")
-        self.run_dependency_worker(missing_qgis, missing_python)
+        self.start_installation(missing_qgis, missing_python)
 
     # ==============================================================================
-    # Lógica do Worker Threading (Evita travamentos)
+    # Coordenação de instalação: pip em QThread; plugins do QGIS na thread principal
     # ==============================================================================
-    
-    def run_dependency_worker(self, qgis_plugins, python_packages):
+
+    def start_installation(self, qgis_plugins, python_packages):
         """
-        Configura e inicializa a QThread de correção de dependências.
+        Inicia o processo de instalação: pacotes Python via pip numa QThread e,
+        em seguida, plugins do QGIS na thread principal (o pyplugin_installer
+        carrega e ativa plugins e não é seguro chamá-lo fora dela).
         """
+        if self._busy:
+            QMessageBox.information(self, "Sincronizador", "Já existe uma operação em andamento.")
+            return
+        if not qgis_plugins and not python_packages:
+            return
+
+        self._busy = True
+        self._install_cancelled = False
+        self._install_queue = list(qgis_plugins)
+        self._newly_installed = []
+
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.tabs.setEnabled(False) # Bloqueia abas para evitar modificações concorrentes
-        
-        self.worker = DependencyFixerWorker(qgis_plugins, python_packages)
-        self.worker.log_signal.connect(self.log)
-        self.worker.progress_signal.connect(self.progress_bar.setValue)
-        self.worker.finished_signal.connect(self.on_worker_finished)
-        self.worker.start()
+        self.btn_cancel.setVisible(True)
+        self.tabs.setEnabled(False)
 
-    def on_worker_finished(self, success, message):
+        if python_packages:
+            self.log(f"=== Instalando {len(python_packages)} pacotes Python (pip) ===")
+            self.worker = PipInstallWorker(python_packages)
+            self.worker.log_signal.connect(self.log)
+            self.worker.progress_signal.connect(lambda value: self.progress_bar.setValue(int(value / 2)))
+            self.worker.finished_signal.connect(self._on_pip_phase_finished)
+            self.worker.start()
+        else:
+            self._on_pip_phase_finished(True, "")
+
+    def _on_pip_phase_finished(self, success, message):
+        if message:
+            self.log(message)
+        if not success:
+            self._finish_installation(cancelled=True)
+            return
+        self._install_qgis_plugins_phase()
+
+    def _install_qgis_plugins_phase(self):
         """
-        Chamado quando a thread de instalação é encerrada.
+        Instala os plugins do QGIS pendentes na thread principal.
         """
-        self.log(message)
+        queue = self._install_queue
+        total = len(queue)
+        if total == 0:
+            self._finish_installation(cancelled=False)
+            return
+
+        self.log(f"=== Instalando {total} plugins do QGIS ===")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            installer = None
+            try:
+                import pyplugin_installer
+                installer = pyplugin_installer.instance()
+                self.log("Atualizando lista de repositórios de plugins do QGIS...")
+                installer.fetchAvailablePlugins(False)
+            except Exception as e:
+                self.log(f"Aviso: instalador de plugins do QGIS indisponível ({str(e)}).")
+
+            for i, plugin_key in enumerate(queue):
+                if self._install_cancelled:
+                    self.log("Instalação de plugins cancelada pelo usuário.")
+                    break
+
+                self.log(f"Instalando plugin do QGIS: {plugin_key}...")
+                ok = False
+                if installer:
+                    try:
+                        # installPlugin() é void no QGIS: o sucesso é verificado
+                        # pela presença da pasta do plugin após a instalação.
+                        installer.installPlugin(plugin_key)
+                        ok = self._is_plugin_installed(plugin_key)
+                    except Exception as e:
+                        self.log(f"Erro durante instalação do plugin '{plugin_key}': {str(e)}")
+                else:
+                    self.log(f"Impossível instalar '{plugin_key}': módulo pyplugin_installer indisponível.")
+
+                if ok:
+                    self._newly_installed.append(plugin_key)
+                    self.log(f"Plugin '{plugin_key}' instalado com sucesso!")
+                else:
+                    self.log(f"Falha ao instalar o plugin '{plugin_key}' (não encontrado ou erro de download).")
+
+                self.progress_bar.setValue(50 + int((i + 1) / total * 50))
+                QApplication.processEvents()
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self._finish_installation(cancelled=self._install_cancelled)
+
+    def _finish_installation(self, cancelled):
+        """
+        Sempre executado ao término da instalação (mesmo com erro ou cancelamento),
+        garantindo que a interface seja reativada.
+        """
+        self._busy = False
         self.progress_bar.setVisible(False)
+        self.btn_cancel.setVisible(False)
         self.tabs.setEnabled(True)
         self.worker = None
-        
-        if success:
-            QMessageBox.information(self, "Sincronizador", message)
+
+        newly_installed = self._newly_installed
+        self._newly_installed = []
+
+        restore_summary = self._pending_restore_summary
+        self._pending_restore_summary = None
+
+        if restore_summary is not None:
+            # Ativa apenas os plugins cuja instalação foi confirmada
+            q_settings = QSettings()
+            for key in newly_installed:
+                q_settings.setValue(f"PythonPlugins/{key}", True)
+
+            if cancelled:
+                QMessageBox.warning(
+                    self, "Restauração",
+                    "Operação interrompida antes da instalação dos plugins pendentes.\n"
+                    "As configurações e provedores já restaurados foram mantidos.")
+            else:
+                msg = (f"Restauração concluída!\n\n"
+                       f"• Plugins ativados: {restore_summary['ativados'] + len(newly_installed)}\n"
+                       f"• Plugins instalados agora: {len(newly_installed)} de {restore_summary['a_instalar']}\n"
+                       f"• Configurações de plugins restauradas: {restore_summary['configs']}\n"
+                       f"• Provedores de conteúdo restaurados: {restore_summary['provedores']}\n\n"
+                       f"Reinicie o QGIS para carregar os plugins ativados.")
+                self.log("Restauração concluída.")
+                QMessageBox.information(self, "Restauração Concluída", msg)
+        elif cancelled:
+            QMessageBox.warning(self, "Aviso", "Operação cancelada pelo usuário.")
         else:
-            QMessageBox.warning(self, "Aviso", message)
-            
-        # Atualiza tabelas para refletir as instalações concluídas
+            QMessageBox.information(
+                self, "Sincronizador",
+                "Processo de instalação concluído!\nReinicie o QGIS se plugins foram instalados ou ativados.")
+
         self.refresh_export_table()
         if self.backup_data:
             self.refresh_import_table()
-        self.check_dependencies() # Re-verifica dependências
+        self.check_dependencies(interactive=False)
+
+    def cancel_installation(self):
+        self._install_cancelled = True
+        worker = self.worker
+        if worker is not None:
+            worker.cancel()
+        self.log("Cancelamento solicitado. Finalizando a etapa atual...")
+
+    def closeEvent(self, event):
+        if self._busy and not self._force_close:
+            QMessageBox.information(
+                self, "Sincronizador",
+                "Há uma operação em andamento. Cancele-a ou aguarde a conclusão antes de fechar.")
+            event.ignore()
+            return
+        event.accept()
+
+    def shutdown(self):
+        """
+        Encerra o diálogo com segurança: cancela operações em curso e aguarda o worker.
+        """
+        if self._busy:
+            self.cancel_installation()
+        worker = self.worker
+        if worker is not None:
+            worker.wait(10000)
+        self._force_close = True
+        self.close()

@@ -48,7 +48,7 @@ class BackupPlugin:
             
         if self.dialog:
             try:
-                self.dialog.close()
+                self.dialog.shutdown()
             except Exception:
                 pass
             self.dialog = None
