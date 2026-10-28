@@ -19,7 +19,7 @@ if ROOT not in sys.path:
 
 def _install_qgis_pyqt_shim() -> None:
     try:
-        import qgis.PyQt  # noqa: F401  (QGIS real disponível)
+        import qgis.PyQt  # noqa: F401  # QGIS real disponível
         return
     except ImportError:
         pass

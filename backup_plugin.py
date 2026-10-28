@@ -1,69 +1,60 @@
 # -*- coding: utf-8 -*-
+"""
+Classe principal do plugin BackupQgis: registra a ação no menu e na barra de
+ferramentas e abre o diálogo.
+"""
 
 import os
+from typing import Any, Optional
+
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
 
+MENU_NAME = "BackupQgis"
+
+
 class BackupPlugin:
-    """
-    Classe principal do plugin QGIS para Sincronização, Backup e Correção de Pendências.
-    """
-    def __init__(self, iface):
+    """Ponto de entrada carregado pelo QGIS via ``classFactory``."""
+
+    def __init__(self, iface: Any) -> None:
         self.iface = iface
         self.plugin_dir = os.path.dirname(__file__)
-        self.action = None
+        self.action: Optional[QAction] = None
         self.dialog = None
 
-    def tr(self, message):
-        # Tradução simples ou padrão do QGIS
-        return QCoreApplication.translate('BackupPlugin', message)
+    def tr(self, message: str) -> str:
+        return QCoreApplication.translate("BackupPlugin", message)
 
-    def initGui(self):
-        """
-        Adiciona os botões e itens de menu do plugin na interface do QGIS.
-        """
-        icon_path = os.path.join(self.plugin_dir, 'icon.png')
-        icon = QIcon(icon_path)
-        
-        # Cria a ação que abre o diálogo
-        self.action = QAction(
-            icon,
-            self.tr('Sincronizar Plugins e Configurações...'),
-            self.iface.mainWindow()
-        )
+    def initGui(self) -> None:
+        """Adiciona a ação ao menu Plugins e à barra de ferramentas de plugins."""
+        icon = QIcon(os.path.join(self.plugin_dir, "icon.png"))
+        self.action = QAction(icon, self.tr("BackupQgis: plugins, configurações e conexões..."),
+                              self.iface.mainWindow())
         self.action.triggered.connect(self.run)
-
-        # Adiciona a ação ao menu 'Plugins' e à barra de ferramentas de plugins
-        self.iface.addPluginToMenu(self.tr('Sincronizador de Plugins'), self.action)
+        self.iface.addPluginToMenu(self.tr(MENU_NAME), self.action)
         self.iface.addToolBarIcon(self.action)
 
-    def unload(self):
-        """
-        Remove os botões e itens de menu do plugin quando ele é desativado.
-        """
+    def unload(self) -> None:
+        """Remove a ação e encerra tarefas em andamento antes de o plugin ser descarregado."""
         if self.action:
-            self.iface.removePluginMenu(self.tr('Sincronizador de Plugins'), self.action)
+            self.iface.removePluginMenu(self.tr(MENU_NAME), self.action)
             self.iface.removeToolBarIcon(self.action)
-            
-        if self.dialog:
+            self.action = None
+        if self.dialog is not None:
             try:
-                self.dialog.close()
-            except Exception:
+                self.dialog.shutdown()
+                self.dialog.deleteLater()
+            except RuntimeError:
                 pass
             self.dialog = None
 
-    def run(self):
-        """
-        Executa a ação principal do plugin abrindo o diálogo do usuário.
-        """
-        from .backup_plugin_dialog import BackupPluginDialog
-        
-        # Cria o diálogo se ele ainda não existir
+    def run(self) -> None:
+        """Abre (ou traz para frente) o diálogo principal."""
+        from .ui.dialog import BackupPluginDialog
+
         if self.dialog is None:
-            self.dialog = BackupPluginDialog(self.iface)
-            
-        # Exibe o diálogo
+            self.dialog = BackupPluginDialog(self.iface, self.plugin_dir)
         self.dialog.show()
         self.dialog.raise_()
         self.dialog.activateWindow()
