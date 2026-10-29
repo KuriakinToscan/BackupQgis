@@ -225,3 +225,51 @@ def test_copy_preserves_mtime_and_cancel(tmp_path):
     with pytest.raises(CopyCancelled):
         copy_file(str(src), str(tmp_path / "out2" / "a.bin"), is_canceled=lambda: True)
     assert os.listdir(tmp_path / "out2") == []
+
+
+def test_bidirectional_sync(tmp_path):
+    from core.sync import (build_bidirectional_plan, build_state, execute_bidirectional, guard_bidirectional,
+                           load_state, save_state)
+    a, b = tmp_path / "a", tmp_path / "b"
+    now = time.time()
+    _write(a / "comum.txt", "igual", mtime=now - 50)
+    _write(b / "comum.txt", "igual", mtime=now - 40)  # mesmo conteúdo, mtime diferente
+    _write(a / "so_a.txt", "a")
+    _write(b / "so_b.txt", "b")
+
+    def same(rel):
+        return (a / rel).read_bytes() == (b / rel).read_bytes()
+
+    plan = build_bidirectional_plan(str(a), str(b), scan_tree(str(a)), scan_tree(str(b)), {}, same_content=same)
+    assert plan.a_to_b == ["so_a.txt"] and plan.b_to_a == ["so_b.txt"] and not plan.conflicts
+    guard_bidirectional(plan)
+    execute_bidirectional(plan, print, lambda: False, lambda d, t: None)
+    state_path = tmp_path / "estado.json"
+    save_state(str(state_path), build_state(scan_tree(str(a)), scan_tree(str(b))))
+    state = load_state(str(state_path))
+    assert set(state) == {"so_a.txt", "so_b.txt"}  # comum.txt tem mtime diferente: fica fora do estado
+
+    # alteração em B, remoção em A, conflito nos dois lados
+    _write(b / "so_a.txt", "a2", mtime=now + 20)
+    os.remove(a / "so_b.txt")
+    plan = build_bidirectional_plan(str(a), str(b), scan_tree(str(a)), scan_tree(str(b)), state)
+    assert plan.b_to_a == ["so_a.txt"] and plan.delete_b == ["so_b.txt"]
+    assert plan.conflicts == [("comum.txt", "b")]  # sem estado e diferente: conflito, B mais recente
+    guard_bidirectional(plan, force=True)
+    stats = execute_bidirectional(plan, print, lambda: False, lambda d, t: None)
+    assert stats["b_to_a"] == 1 and stats["trashed"] == 1 and stats["conflicts"] == 1
+    assert (a / "so_a.txt").read_text(encoding="utf-8") == "a2"
+    assert not (b / "so_b.txt").exists() and list((b / ".backupqgis_trash").rglob("so_b.txt"))
+    conflict_copies = list(a.glob("comum (conflito origem *).txt"))
+    assert len(conflict_copies) == 1 and list(b.glob("comum (conflito origem *).txt"))
+
+
+def test_bidirectional_guard_empty_side(tmp_path):
+    from core.sync import build_bidirectional_plan, guard_bidirectional
+    a, b = tmp_path / "a", tmp_path / "b"
+    _write(a / "x.txt", "x")
+    b.mkdir()
+    state = {"x.txt": [1, 0, 1, 0]}
+    plan = build_bidirectional_plan(str(a), str(b), scan_tree(str(a)), scan_tree(str(b)), state)
+    with pytest.raises(SyncAborted):
+        guard_bidirectional(plan)  # B vazio depois de já ter sincronizado: HD trocado/vazio
