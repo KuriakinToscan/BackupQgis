@@ -118,31 +118,36 @@ def _strip_vsi(path: str) -> str:
     return path
 
 
-def _file_from_driver_syntax(rest: str, base_dir: str) -> str:
+def _driver_syntax_raw(rest: str, base_dir: str) -> Tuple[str, str]:
     """
     Extrai o caminho de sintaxes ``DRIVER:"caminho":sub`` ou ``DRIVER:caminho:sub``.
     Testa os cortes possíveis da direita para a esquerda e usa o primeiro que existe.
+
+    :returns: (trecho bruto como aparece na fonte, caminho absoluto).
     """
     rest = rest.strip()
     if rest.startswith('"'):
         end = rest.find('"', 1)
-        return _resolve(rest[1:end] if end > 0 else rest[1:], base_dir)
+        raw = rest[1:end] if end > 0 else rest[1:]
+        return raw, _resolve(raw, base_dir)
     parts = rest.split(":")
     for cut in range(len(parts), 0, -1):
-        candidate = _resolve(":".join(parts[:cut]), base_dir)
+        raw = ":".join(parts[:cut])
+        candidate = _resolve(raw, base_dir)
         if os.path.exists(candidate):
-            return candidate
-    return _resolve(rest, base_dir)
+            return raw, candidate
+    return rest, _resolve(rest, base_dir)
 
 
-def datasource_to_path(provider: str, datasource: str, base_dir: str) -> Optional[str]:
+def datasource_raw_path(provider: str, datasource: str, base_dir: str) -> Optional[Tuple[str, str]]:
     """
-    Converte a fonte de uma camada de arquivo em caminho absoluto.
+    Localiza o caminho de arquivo dentro do texto da fonte de uma camada.
 
     :param provider: chave do provedor (``ogr``, ``gdal``, ``spatialite``...).
     :param datasource: texto de ``<datasource>`` no projeto.
     :param base_dir: pasta do projeto (base dos caminhos relativos).
-    :returns: caminho absoluto ou ``None`` se a fonte não for um arquivo.
+    :returns: (trecho bruto exatamente como aparece no texto, caminho absoluto),
+        ou ``None`` se a fonte não for um arquivo local.
     """
     ds = datasource.strip()
     if not ds:
@@ -153,27 +158,40 @@ def datasource_to_path(provider: str, datasource: str, base_dir: str) -> Optiona
         match = _DBNAME_RE.search(ds)
         if not match:
             return None
-        return _resolve(next(g for g in match.groups() if g is not None), base_dir)
+        raw = next(g for g in match.groups() if g is not None)
+        return raw, _resolve(raw, base_dir)
 
-    if provider == "delimitedtext" or provider == "gpx":
-        return _resolve(ds.split("?", 1)[0], base_dir)
+    if provider in ("delimitedtext", "gpx"):
+        raw = ds.split("?", 1)[0]
+        return raw, _resolve(raw, base_dir)
 
     if provider in ("vectortile", "xyzvectortiles", "mbtilesvectortiles"):
         params = dict(urllib.parse.parse_qsl(ds, keep_blank_values=True))
         url = params.get("url", "")
         if url.startswith("file:") or (url and not re.match(r"^[a-z]+://", url)):
-            return _resolve(url, base_dir)
+            return url, _resolve(url, base_dir)
         return None
 
     path = ds.split("|", 1)[0]
     if path.lower().startswith("/vsi"):
-        return _resolve(_strip_vsi(path), base_dir)
+        raw = _strip_vsi(path)
+        return raw, _resolve(raw, base_dir)
     if re.match(r"^[a-z][a-z0-9+.-]*://", path, re.IGNORECASE) and not path.lower().startswith("file://"):
         return None
     match = _DRIVER_PREFIX_RE.match(path)
     if match and provider in ("gdal", "mdal", "ogr", "pdal") and not path.lower().startswith("file:"):
-        return _file_from_driver_syntax(match.group(2), base_dir)
-    return _resolve(path, base_dir)
+        return _driver_syntax_raw(match.group(2), base_dir)
+    return path, _resolve(path, base_dir)
+
+
+def datasource_to_path(provider: str, datasource: str, base_dir: str) -> Optional[str]:
+    """
+    Converte a fonte de uma camada de arquivo em caminho absoluto.
+
+    :returns: caminho absoluto ou ``None`` se a fonte não for um arquivo local.
+    """
+    found = datasource_raw_path(provider, datasource, base_dir)
+    return found[1] if found else None
 
 
 def sidecar_files(path: str) -> List[str]:
