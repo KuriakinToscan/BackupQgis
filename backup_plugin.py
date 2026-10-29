@@ -7,7 +7,7 @@ ferramentas e abre o diálogo.
 import os
 from typing import Any, Optional
 
-from qgis.PyQt.QtCore import QCoreApplication
+from qgis.PyQt.QtCore import QCoreApplication, QLocale, QSettings, QTranslator
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
 
@@ -23,6 +23,23 @@ class BackupPlugin:
         self.action: Optional[QAction] = None
         self.dialog = None
         self.automation = None
+        self.translator: Optional[QTranslator] = None
+        self._install_translator()
+
+    def _install_translator(self) -> None:
+        """
+        Carrega ``i18n/BackupQgis_<idioma>.qm`` conforme o idioma da interface do
+        QGIS. Os textos-fonte estão em português; sem arquivo .qm, nada muda.
+        """
+        locale = str(QSettings().value("locale/userLocale", "") or QLocale.system().name())
+        for name in (locale, locale[:2]):
+            path = os.path.join(self.plugin_dir, "i18n", f"BackupQgis_{name}.qm")
+            if name and os.path.isfile(path):
+                translator = QTranslator()
+                if translator.load(path):
+                    QCoreApplication.installTranslator(translator)
+                    self.translator = translator
+                return
 
     def tr(self, message: str) -> str:
         return QCoreApplication.translate("BackupPlugin", message)
@@ -62,6 +79,9 @@ class BackupPlugin:
             except RuntimeError:
                 pass
             self.dialog = None
+        if self.translator is not None:
+            QCoreApplication.removeTranslator(self.translator)
+            self.translator = None
 
     def run(self) -> None:
         """Abre (ou traz para frente) o diálogo principal."""

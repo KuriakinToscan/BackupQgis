@@ -61,11 +61,17 @@ assert "PostgreSQL/connections/ibama/password" not in doc["server_connections"]
 assert doc["omitted_sensitive_keys"] == ["PostgreSQL/connections/ibama/password"]
 assert [p["key"] for p in doc["plugins"]] == ["QuickOSM"]
 assert "Processing/Configuration/FOLDER" not in doc["settings"]
+assert not dlg.chk_exp_auth.isEnabled()  # stub sem QgsAuthManager
+plugins_zip = out[:-5] + ".plugins.zip"
+import zipfile as _zf
+assert os.path.isfile(plugins_zip) and "QuickOSM/metadata.txt" in _zf.ZipFile(plugins_zip).namelist()
 
 # altera e restaura
 s.setValue("QuickOSM/lastQuery", "mudou"); s.remove("qgis/connections-wms/IBGE/url"); s.sync()
 QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (out, ""))
 dlg.load_backup_file()
+assert dlg.backup_archive == plugins_zip and dlg.backup_archive_keys == ["QuickOSM"]
+assert "ZIP de plugins" in dlg.imp_notes.text()
 print("import rows:", dlg.imp_plugins.row_count(), dlg.imp_conns.row_count(), dlg.imp_counter.text())
 captured = {}
 orig_init = P.RestorePreviewDialog.__init__

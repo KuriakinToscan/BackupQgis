@@ -118,21 +118,56 @@ def activate_plugin(key: str, log: LogFn) -> Tuple[bool, bool]:
     return False, True
 
 
+def install_from_archive(key: str, archive: str, log: LogFn) -> bool:
+    """
+    Instala um plugin a partir do ZIP de plugins do backup, na pasta de
+    plugins do perfil atual (thread principal).
+
+    :returns: ``True`` se o plugin ficou instalado.
+    """
+    import qgis.utils
+    from .plugin_archive import PluginArchiveError, extract_plugin
+
+    home = getattr(qgis.utils, "home_plugin_path", "")
+    if not home:
+        log(f"Impossível instalar '{key}' do ZIP: pasta de plugins do perfil desconhecida.")
+        return False
+    try:
+        path = extract_plugin(archive, key, home)
+    except (OSError, PluginArchiveError) as exc:
+        log(f"Falha ao instalar '{key}' do ZIP: {exc}")
+        return False
+    updater = getattr(qgis.utils, "updateAvailablePlugins", None)
+    if callable(updater):
+        try:
+            updater()
+        except Exception as exc:
+            log(f"Lista de plugins não atualizada: {exc}")
+    log(f"Plugin '{key}' instalado a partir do ZIP do backup em {path}.")
+    return True
+
+
 def install_and_activate(
     keys: List[str],
     log: LogFn,
     process_events: Callable[[], None],
     is_canceled: Callable[[], bool],
     progress: Callable[[int, int], None],
+    archive: Optional[str] = None,
+    archive_keys: Optional[List[str]] = None,
 ) -> Dict[str, List[str]]:
     """
     Instala os plugins ausentes e ativa todos os da lista, um por vez.
+    O repositório tem preferência; o ZIP de plugins do backup (``archive``)
+    é usado para os que não estão em nenhum repositório configurado.
 
     :param keys: pastas (ou nomes) dos plugins.
     :param log: função de log.
     :param process_events: chamada entre plugins para manter a interface responsiva.
     :param is_canceled: interrompe o laço quando retorna ``True``.
     :param progress: ``progress(feitos, total)``.
+    :param archive: ZIP de plugins do backup, se houver.
+    :param archive_keys: plugins contidos em ``archive``.
     :returns: ``{"installed": [...], "activated": [...], "failed": [...], "restart": [...]}``.
     """
     summary: Dict[str, List[str]] = {"installed": [], "activated": [], "failed": [], "restart": []}
@@ -149,7 +184,14 @@ def install_and_activate(
         if not _is_installed(raw_key):
             key = resolve_repository_key(raw_key, available) or raw_key
             if not _is_installed(key):
-                if not install_plugin(key, available, log):
+                if key in available:
+                    ok = install_plugin(key, available, log)
+                elif archive and raw_key in (archive_keys or []):
+                    key = raw_key
+                    ok = install_from_archive(key, archive, log)
+                else:
+                    ok = install_plugin(key, available, log)
+                if not ok:
                     summary["failed"].append(raw_key)
                     continue
                 summary["installed"].append(key)

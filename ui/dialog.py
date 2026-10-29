@@ -18,7 +18,7 @@ from qgis.core import Qgis, QgsApplication, QgsMessageLog
 from qgis.gui import QgsCollapsibleGroupBox, QgsMessageBar
 from qgis.PyQt.QtCore import QSettings, QSize, Qt
 from qgis.PyQt.QtGui import QFontDatabase, QGuiApplication, QIcon
-from qgis.PyQt.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
+from qgis.PyQt.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QInputDialog,
                                  QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
                                  QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy,
                                  QSpinBox, QStackedWidget, QStyle, QTabWidget, QToolButton, QVBoxLayout, QWidget)
@@ -29,10 +29,12 @@ from ..core.backup_file import (BackupFormatError, build_backup_document, build_
 from ..core.compat import enum_value
 from ..core.deps import find_python_interpreter, is_distribution_installed, read_plugin_dependencies
 from ..core.keys import is_sensitive_key, remap_path_prefix
+from ..core.plugin_archive import PluginArchiveError, archive_keys, archive_path_for, write_plugins_archive
 from ..core.plugins import resolve_plugin_name
 from ..core.settings_io import canonical, deserialize_value, read_values, serialize_value, snapshot_keys
 from ..tasks.pip_task import PipInstallTask
 from ..tasks.scan_task import ScanTask
+from .auth_io import AuthTransferError, auth_transfer_available, authcfg_path_for, export_authcfg, import_authcfg
 from .common import AUTO_GROUP, source_info
 from .preview_dialog import RestorePreviewDialog, build_preview_rows
 from .projects_page import ProjectsPage
@@ -79,6 +81,9 @@ class BackupPluginDialog(QDialog):
         self.scan = None  # ScanResult mais recente
         self.backup_doc: Optional[Dict[str, Any]] = None
         self.backup_path = ""
+        self.backup_archive: Optional[str] = None
+        self.backup_archive_keys: List[str] = []
+        self.backup_authcfg: Optional[str] = None
         self._tasks: List[Any] = []
         self._busy = False
         self._cancel_requested = False
@@ -213,8 +218,19 @@ class BackupPluginDialog(QDialog):
         self.chk_exp_repos.setChecked(True)
         self.chk_exp_secrets = QCheckBox(self.tr("Incluir senhas e tokens (texto puro)"), page)
         self.chk_exp_secrets.toggled.connect(self._warn_secrets)
+        self.chk_exp_zip = QCheckBox(self.tr("Incluir ZIP dos plugins fora dos repositórios"), page)
+        self.chk_exp_zip.setToolTip(self.tr("Copia para <backup>.plugins.zip os plugins selecionados que não estão "
+                                            "em nenhum repositório configurado (instalados por ZIP ou de repositório "
+                                            "privado). Na restauração, o repositório tem preferência."))
+        self.chk_exp_zip.setChecked(True)
+        self.chk_exp_auth = QCheckBox(self.tr("Exportar autenticação (authcfg) com senha"), page)
+        self.chk_exp_auth.setToolTip(self.tr("Grava <backup>.authcfg.xml, criptografado pelo QGIS com uma senha "
+                                             "que você escolhe (requer QGIS 3.20+)."))
+        self.chk_exp_auth.setEnabled(auth_transfer_available())
         options.addWidget(self.chk_exp_repos)
         options.addWidget(self.chk_exp_secrets)
+        options.addWidget(self.chk_exp_zip)
+        options.addWidget(self.chk_exp_auth)
         options.addStretch()
         layout.addLayout(options)
 
@@ -638,6 +654,8 @@ class BackupPluginDialog(QDialog):
                 fallback_keys=fallbacks,
             )
             write_json_atomic(path, doc)
+            zipped = self._export_plugin_zip(path, [plugins_by_key[k] for k in plugin_keys]) \
+                if self.chk_exp_zip.isChecked() and plugin_keys else []
         except (OSError, TypeError, ValueError) as exc:
             QApplication.restoreOverrideCursor()
             self.log(self.tr("Falha ao gravar o backup: {0}").format(exc), "Critical")
@@ -654,8 +672,59 @@ class BackupPluginDialog(QDialog):
             self.log(self.tr("{0} chaves de senha/token não foram exportadas.").format(len(omitted)))
         for key in fallbacks:
             self.log(self.tr("Valor de tipo desconhecido gravado como texto: {0}").format(key), "Warning")
+        if zipped:
+            self.log(self.tr("ZIP de plugins gravado ({0}): {1}").format(len(zipped), ", ".join(zipped)), "Success")
         self.notify(self.tr("Backup gravado: {0} plugins, {1} configurações, {2} conexões.").format(
             len(plugin_keys), n_settings, len(providers)), "Success")
+        if self.chk_exp_auth.isChecked() and self.chk_exp_auth.isEnabled():
+            self._export_auth(path)
+
+    def _export_plugin_zip(self, backup_path: str, plugins: List[Dict[str, Any]]) -> List[str]:
+        """Grava o ZIP dos plugins que não estão em repositórios; retorna as chaves incluídas."""
+        available = installer.repository_plugins(refresh=False, log=self.log)
+        if available:
+            outside = [p for p in plugins if not available.get(p["key"], {}).get("zip_repository")]
+        else:
+            self.log(self.tr("Lista dos repositórios não carregada; todos os plugins selecionados vão no ZIP."))
+            outside = list(plugins)
+        if not outside:
+            return []
+        return write_plugins_archive(archive_path_for(backup_path), [(p["key"], p["path"]) for p in outside],
+                                     self.log)
+
+    def _ask_password(self, title: str, confirm: bool) -> Optional[str]:
+        """Pede uma senha (duas vezes se ``confirm``); ``None`` se cancelado."""
+        echo = enum_value(QLineEdit, "EchoMode", "Password")
+        while True:
+            pwd, ok = QInputDialog.getText(self, title, self.tr("Senha do arquivo de autenticação:"), echo)
+            if not ok:
+                return None
+            if not pwd:
+                QMessageBox.warning(self, title, self.tr("A senha não pode ser vazia."))
+                continue
+            if not confirm:
+                return pwd
+            again, ok = QInputDialog.getText(self, title, self.tr("Repita a senha:"), echo)
+            if not ok:
+                return None
+            if again == pwd:
+                return pwd
+            QMessageBox.warning(self, title, self.tr("As senhas não conferem."))
+
+    def _export_auth(self, backup_path: str) -> None:
+        pwd = self._ask_password(self.tr("Exportar autenticação"), confirm=True)
+        if pwd is None:
+            self.log(self.tr("Exportação de authcfg cancelada."))
+            return
+        try:
+            n = export_authcfg(authcfg_path_for(backup_path), pwd, self.log)
+        except AuthTransferError as exc:
+            self.log(str(exc), "Warning")
+            self.notify(str(exc), "Warning", 0)
+            return
+        if n:
+            self.notify(self.tr("{0} configurações de autenticação exportadas (arquivo protegido por senha).")
+                        .format(n), "Success")
 
     # ------------------------------------------------------------------
     # Importação
@@ -685,6 +754,19 @@ class BackupPluginDialog(QDialog):
             os.path.basename(path), self._format_date(doc.get("created_at", "")), origin))
 
         notes = list(warnings)
+        archive = archive_path_for(path)
+        self.backup_archive, self.backup_archive_keys = None, []
+        if os.path.isfile(archive):
+            try:
+                self.backup_archive_keys = archive_keys(archive)
+                self.backup_archive = archive
+                notes.append(self.tr("ZIP de plugins encontrado ({0}): usado para os que não estiverem nos "
+                                     "repositórios.").format(", ".join(self.backup_archive_keys)))
+            except PluginArchiveError as exc:
+                notes.append(str(exc))
+        self.backup_authcfg = authcfg_path_for(path) if os.path.isfile(authcfg_path_for(path)) else None
+        if self.backup_authcfg:
+            notes.append(self.tr("Arquivo de autenticação (authcfg) encontrado; será oferecida a importação."))
         if doc.get("omitted_sensitive_keys"):
             notes.append(self.tr("O backup não contém {0} senhas/tokens; será preciso digitá-los nas conexões "
                                  "restauradas.").format(len(doc["omitted_sensitive_keys"])))
@@ -862,15 +944,36 @@ class BackupPluginDialog(QDialog):
         if plugins:
             summary = self._run_plugin_installs(plugins)
 
+        if self.backup_authcfg and auth_transfer_available():
+            self._import_auth(self.backup_authcfg)
+
         self._update_import_buttons()
         self._show_restore_summary(len(values), summary)
         self.start_scan()
+
+    def _import_auth(self, path: str) -> None:
+        answer = QMessageBox.question(
+            self, self.tr("Importar autenticação"),
+            self.tr("O backup inclui configurações de autenticação (authcfg). Importar agora?\n"
+                    "Configurações com o mesmo id já existentes nesta máquina são mantidas."))
+        if answer != enum_value(QMessageBox, "StandardButton", "Yes"):
+            return
+        pwd = self._ask_password(self.tr("Importar autenticação"), confirm=False)
+        if pwd is None:
+            return
+        try:
+            import_authcfg(path, pwd, False, self.log)
+            self.log(self.tr("Configurações de autenticação importadas."), "Success")
+        except AuthTransferError as exc:
+            self.log(str(exc), "Warning")
+            self.notify(str(exc), "Warning", 0)
 
     def _run_plugin_installs(self, keys: List[str]) -> Dict[str, List[str]]:
         self._set_busy(True, self.tr("Instalando e ativando plugins..."), cancellable=True)
         try:
             return installer.install_and_activate(
-                keys, self.log, QApplication.processEvents, lambda: self._cancel_requested, self._set_progress)
+                keys, self.log, QApplication.processEvents, lambda: self._cancel_requested, self._set_progress,
+                self.backup_archive, self.backup_archive_keys)
         finally:
             self._set_busy(False)
 

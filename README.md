@@ -14,8 +14,8 @@ máquinas, perfis e versões do QGIS.
 | Repositórios de plugins | Sim | Grupo `app/plugin_repositories`. |
 | Conexões de provedores | Sim | Inclui o esquema antigo (`qgis/connections-*`, `<Provedor>/connections/...`) e a árvore nova do QGIS 3.30+ (`connections/.../items/...`). |
 | Senhas e tokens | **Não, por padrão** | Podem ser incluídos marcando a opção; ficam em **texto puro** no JSON. |
-| Configurações de autenticação (authcfg) | Não | Conexões que usam authcfg precisam da configuração criada na máquina de destino. |
-| Plugins instalados por ZIP ou de repositório privado não configurado | Não | Aparecem como falha na restauração. |
+| Configurações de autenticação (authcfg) | Opcional | Arquivo `<backup>.authcfg.xml` criptografado pelo QGIS com senha escolhida na exportação (QGIS 3.20+). Importação oferecida na restauração, sem sobrescrever ids existentes. |
+| Plugins instalados por ZIP ou de repositório privado não configurado | Sim, por padrão | Copiados para `<backup>.plugins.zip`. Na restauração, o repositório tem preferência; o ZIP é usado para os demais e extraído na pasta de plugins do perfil. |
 | Projetos e dados | Sim, na página Projetos | Ver abaixo. |
 
 ## Restauração segura
@@ -46,6 +46,18 @@ preservando os caminhos relativos entre projeto e dados. A cópia é feita em `<
 é renomeada no fim; cancelar não deixa snapshot incompleto. A retenção apaga apenas snapshots antigos
 criados pelo próprio plugin. O destino precisa existir: com o HD/NAS desconectado o backup não começa.
 
+- **Empacotar...** copia o projeto e os dados para `<pasta>/<projeto>/` (ou `<projeto>.zip`) e
+  reescreve as fontes das camadas para caminhos relativos, de modo que o pacote abre em qualquer
+  computador. A estrutura de pastas é mantida a partir da pasta comum a projeto e dados (ou espelha
+  o caminho absoluto, quando estão em unidades diferentes). Camadas de banco e serviços continuam
+  apontando para o servidor original.
+- **Restaurar snapshot...** devolve os arquivos aos caminhos originais (idênticos são mantidos;
+  diferentes só são substituídos se você escolher, e a versão atual vira
+  `*.antes-restauracao-<data>`) ou recria tudo numa pasta nova, com os projetos reescritos para os
+  arquivos restaurados.
+- **Guardar versão do projeto a cada salvamento** copia o `.qgz`/`.qgs` (sem os dados) para
+  `<destino>/versoes/<projeto>/` a cada salvamento no QGIS, mantendo as N versões mais recentes.
+
 ## Sincronização entre pastas
 
 A página **Sincronizar** mantém pares origem → destino (ex.: `D:/SIG` → `//nas/backup/SIG`):
@@ -60,8 +72,22 @@ quando o HD/NAS não está montado); origem vazia aborta; espelho que apagaria m
 do destino pede confirmação; cópia atômica que preserva a data de modificação; tolerância de 2 s
 na comparação (FAT/exFAT/SMB); arquivo mais recente no destino não é sobrescrito.
 
-Fora do escopo atual: sincronização bidirecional, gatilhos automáticos e restauração de snapshot
-pela interface (fase 3 da issue #1).
+**Automático a cada N minutos** (pares aditivo e espelho): roda em segundo plano enquanto o QGIS
+estiver aberto, nunca força a trava de segurança e só registra no log quando o destino está
+desconectado. A primeira execução ocorre após um intervalo completo.
+
+**Bidirecional (experimental)**: propaga criações, alterações e exclusões nos dois sentidos com
+base no estado da última sincronização (`<perfil>/backupqgis/sync_state/<par>.json`). Quando o mesmo
+arquivo mudou dos dois lados, o mais recente vence e o outro é preservado como
+`<nome>.conflito-<máquina>-<data><ext>`; exclusões vão para a lixeira do lado correspondente. Na
+primeira execução não há exclusões, só cópias. Não tem modo automático.
+
+## Exportação automática ao fechar
+
+Na página Exportar, a opção **Exportar tudo automaticamente ao fechar o QGIS** grava plugins
+ativos, configurações, conexões e repositórios (sem senhas) em
+`qgis-config_<máquina>_<data>.json` na pasta escolhida, mantendo os N mais recentes. Apontar para
+uma pasta sincronizada com o NAS dá um histórico de configuração sem intervenção.
 
 ## Pendências
 
@@ -75,6 +101,12 @@ interpretador não for encontrado, instale manualmente (no Windows, pelo OSGeo4W
 
 JSON com `schema_version: 2`, dados de origem (versão do QGIS, SO, máquina, perfil), chaves por
 plugin e por conexão. Arquivos da versão 0.1 continuam sendo lidos.
+
+## Traduções
+
+Os textos-fonte estão em português. O plugin carrega `i18n/BackupQgis_<idioma>.qm` conforme o
+idioma do QGIS. Para traduzir: `pylupdate5 i18n/BackupQgis.pro`, editar o `.ts` no Qt Linguist e
+gerar o `.qm` com `lrelease`.
 
 ## Estrutura do código
 

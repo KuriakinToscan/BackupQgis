@@ -3,8 +3,8 @@ name=BackupQgis
 qgisMinimumVersion=3.16
 qgisMaximumVersion=3.99
 description=Backup e restauração de plugins, configurações, conexões e projetos QGIS com os dados vinculados, e sincronização de pastas com HD externo ou NAS.
-about=Exporta para um arquivo JSON a lista de plugins instalados, as configurações de cada plugin, os repositórios de plugins e as conexões de provedores de dados, com seleção granular. Na restauração, mostra uma prévia do que será alterado, guarda uma cópia do estado anterior (permitindo desfazer), instala os plugins ausentes a partir dos repositórios e os ativa. Senhas e tokens não são exportados por padrão. A página Projetos copia projetos .qgz/.qgs e os arquivos de dados que eles usam para snapshots com manifesto SHA-256 (GeoPackage copiado de forma consistente mesmo aberto). A página Sincronizar mantém pastas espelhadas em HD externo ou NAS, com simulação obrigatória, marcador do destino e lixeira. A página Pendências verifica dependências de plugins e de pacotes Python e oferece a instalação após confirmação.
-version=0.2.0
+about=Exporta para um arquivo JSON a lista de plugins instalados, as configurações de cada plugin, os repositórios de plugins e as conexões de provedores de dados, com seleção granular. Na restauração, mostra uma prévia do que será alterado, guarda uma cópia do estado anterior (permitindo desfazer), instala os plugins ausentes a partir dos repositórios e os ativa. Senhas e tokens não são exportados por padrão. A página Projetos copia projetos .qgz/.qgs e os arquivos de dados que eles usam para snapshots com manifesto SHA-256 (GeoPackage copiado de forma consistente mesmo aberto). Também empacota projetos com caminhos relativos, restaura snapshots e guarda versões do projeto a cada salvamento. A página Sincronizar mantém pastas espelhadas em HD externo ou NAS (aditivo, espelho ou bidirecional experimental), com simulação obrigatória, marcador do destino, lixeira e execução automática. A página Pendências verifica dependências de plugins e de pacotes Python e oferece a instalação após confirmação.
+version=0.3.0
 author=Kuriakin Toscan
 email=147505442+KuriakinToscan@users.noreply.github.com
 homepage=https://github.com/KuriakinToscan/BackupQgis
@@ -16,6 +16,15 @@ experimental=True
 deprecated=False
 icon=icon.png
 changelog=
+    0.3.0
+    - Pacote autocontido de projeto (pasta ou ZIP) com caminhos relativos.
+    - Restauração de snapshot para os caminhos originais ou para pasta nova.
+    - Versão do arquivo de projeto a cada salvamento.
+    - Sincronização automática periódica (aditivo/espelho) e modo bidirecional experimental com cópia de conflito.
+    - Exportação automática de configurações ao fechar o QGIS.
+    - Exportação/importação opcional de authcfg protegida por senha (QGIS 3.20+).
+    - ZIP dos plugins fora dos repositórios junto ao backup, usado na restauração.
+    - Carregador de traduções (i18n).
     0.2.0
     - Varredura e instalação de pacotes em segundo plano (QgsTask); instalação de plugins na thread principal.
     - Senhas e tokens omitidos por padrão; gravação atômica do arquivo; formato com schema_version e dados de origem.
