@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from qgis.PyQt.QtCore import QCoreApplication, QLocale, QSettings, QTranslator
 from qgis.PyQt.QtGui import QIcon
-from qgis.core import QgsApplication, QgsMessageLog
+from qgis.core import QgsMessageLog
 from qgis.PyQt.QtWidgets import QAction
 
 MENU_NAME = "BackupQgis"
@@ -67,11 +67,11 @@ class BackupPlugin:
             QgsMessageLog.logMessage(f"Preferências migradas para os grupos separados: {', '.join(moved)}",
                                      "BackupQgis")
 
-        self._add_action(QIcon(os.path.join(self.plugin_dir, "icon.png")),
+        self._add_action(QIcon(os.path.join(self.plugin_dir, "icons", "config.png")),
                          self.tr("Configurações do QGIS (plugins, conexões, autenticação)..."),
                          self.tr("BackupQgis: backup e restauração das configurações do QGIS"),
                          lambda: self.show_window("config"))
-        self._add_action(QgsApplication.getThemeIcon("/mIconQgsProjectFile.svg"),
+        self._add_action(QIcon(os.path.join(self.plugin_dir, "icons", "projetos.png")),
                          self.tr("Projetos e dados (backup e sincronização)..."),
                          self.tr("BackupQgis: backup de projetos com os dados e sincronização de pastas"),
                          lambda: self.show_window("projects"))
