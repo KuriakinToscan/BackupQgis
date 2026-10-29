@@ -17,10 +17,10 @@ from ..core.project_backup import apply_retention, run_project_backup
 from ..core.project_inventory import find_projects, inventory_project, summarize
 from ..core.project_package import build_package, read_manifest, restore_snapshot
 from ..tasks.function_task import FunctionTask
-from .common import AUTO_GROUP
+from .common import PROJECTS_GROUP, as_bool, as_int
 from .widgets import CheckTable, text_item
 
-SETTINGS_KEY = "BackupQgis/projects"
+SETTINGS_KEY = PROJECTS_GROUP
 MAX_ROWS = 5000
 ROLE_LABELS = {"projeto": "Projeto", "dados": "Dados", "auxiliar": "Auxiliar", "recurso": "Recurso"}
 
@@ -96,9 +96,19 @@ class ProjectsPage(QWidget):
                                             "relativos, que abre em qualquer computador."))
         self.btn_package.clicked.connect(self.run_package)
         self.btn_restore = QPushButton(self.tr("Restaurar snapshot..."), self)
-        self.btn_restore.clicked.connect(self.run_restore)
+        self.btn_restore.clicked.connect(lambda: self.run_restore())
+        self.chk_schedule = QCheckBox(self.tr("Snapshot automático a cada"), self)
+        self.chk_schedule.setToolTip(self.tr("Faz o backup da lista de projetos para o destino em segundo plano "
+                                             "enquanto o QGIS estiver aberto. Independe do backup de configurações."))
+        self.schedule_hours = QSpinBox(self)
+        self.schedule_hours.setRange(1, 720)
+        self.schedule_hours.setValue(24)
+        self.schedule_hours.setSuffix(self.tr(" h"))
         extra_row.addWidget(self.chk_version)
         extra_row.addWidget(self.version_keep)
+        extra_row.addSpacing(12)
+        extra_row.addWidget(self.chk_schedule)
+        extra_row.addWidget(self.schedule_hours)
         extra_row.addStretch()
         extra_row.addWidget(self.btn_package)
         extra_row.addWidget(self.btn_restore)
@@ -127,6 +137,8 @@ class ProjectsPage(QWidget):
         self.keep.valueChanged.connect(self._save_settings)
         self.chk_version.toggled.connect(self._save_settings)
         self.version_keep.valueChanged.connect(self._save_settings)
+        self.chk_schedule.toggled.connect(self._save_settings)
+        self.schedule_hours.valueChanged.connect(self._save_settings)
 
     # ------------------------------------------------------------------
     def _load_settings(self) -> None:
@@ -138,21 +150,21 @@ class ProjectsPage(QWidget):
         for path in paths:
             self.projects.addItem(path)
         self.dest.setText(str(settings.value(f"{SETTINGS_KEY}/dest", "")))
-        try:
-            self.keep.setValue(int(settings.value(f"{SETTINGS_KEY}/keep", 10)))
-            self.version_keep.setValue(int(settings.value(f"{AUTO_GROUP}/versionKeep", 20)))
-        except (TypeError, ValueError):
-            pass
-        on_save = settings.value(f"{AUTO_GROUP}/versionOnSave", False)
-        self.chk_version.setChecked(on_save if isinstance(on_save, bool) else str(on_save).lower() in ("true", "1"))
+        self.keep.setValue(as_int(settings.value(f"{SETTINGS_KEY}/keep", 10), 10))
+        self.version_keep.setValue(as_int(settings.value(f"{SETTINGS_KEY}/versionKeep", 20), 20))
+        self.chk_version.setChecked(as_bool(settings.value(f"{SETTINGS_KEY}/versionOnSave", False)))
+        self.chk_schedule.setChecked(as_bool(settings.value(f"{SETTINGS_KEY}/autoSnapshot", False)))
+        self.schedule_hours.setValue(as_int(settings.value(f"{SETTINGS_KEY}/autoSnapshotHours", 24), 24))
 
     def _save_settings(self, *args: Any) -> None:
         settings = QSettings()
         settings.setValue(f"{SETTINGS_KEY}/list", json.dumps(self.project_paths(), ensure_ascii=False))
         settings.setValue(f"{SETTINGS_KEY}/dest", self.dest.text().strip())
         settings.setValue(f"{SETTINGS_KEY}/keep", self.keep.value())
-        settings.setValue(f"{AUTO_GROUP}/versionOnSave", self.chk_version.isChecked())
-        settings.setValue(f"{AUTO_GROUP}/versionKeep", self.version_keep.value())
+        settings.setValue(f"{SETTINGS_KEY}/versionOnSave", self.chk_version.isChecked())
+        settings.setValue(f"{SETTINGS_KEY}/versionKeep", self.version_keep.value())
+        settings.setValue(f"{SETTINGS_KEY}/autoSnapshot", self.chk_schedule.isChecked())
+        settings.setValue(f"{SETTINGS_KEY}/autoSnapshotHours", self.schedule_hours.value())
 
     def project_paths(self) -> List[str]:
         return [self.projects.item(i).text() for i in range(self.projects.count())]
@@ -273,6 +285,9 @@ class ProjectsPage(QWidget):
         if not self._finish(task):
             return
         inventories, snap, manifest, removed = task.value
+        history = getattr(self.host, "history_page", None)
+        if history is not None:
+            history.refresh()
         self._fill_table(inventories)
         n_missing = sum(len(inv.missing) for inv in inventories)
         msg = self.tr("Snapshot {0}: {1} arquivos, {2}.").format(
@@ -348,9 +363,10 @@ class ProjectsPage(QWidget):
         else:
             self.host.notify(msg, "Success")
 
-    def run_restore(self) -> None:
-        """Restaura um snapshot para os caminhos originais ou para uma pasta nova."""
-        snapshot = QFileDialog.getExistingDirectory(self, self.tr("Snapshot a restaurar"), self.dest.text())
+    def run_restore(self, snapshot: str = "") -> None:
+        """Restaura um snapshot (pergunta qual, se não informado) para os caminhos originais ou uma pasta nova."""
+        snapshot = snapshot or QFileDialog.getExistingDirectory(self, self.tr("Snapshot a restaurar"),
+                                                                self.dest.text())
         if not snapshot:
             return
         try:

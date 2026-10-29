@@ -16,12 +16,12 @@ from ..core.file_copy import sha256_file
 from ..core.sync import (BiPlan, SyncAborted, build_bidirectional_plan, build_plan, build_state, check_target,
                          default_excludes_text, execute_bidirectional, execute_plan, guard_bidirectional, guard_plan,
                          init_marker, load_state, parse_excludes, read_marker, save_state, scan_tree)
-from .common import sync_state_path
+from .common import SYNC_PAIRS_KEY, sync_state_path
 from ..tasks.function_task import FunctionTask
 from .projects_page import human_size
 from .widgets import CheckTable, text_item
 
-SETTINGS_KEY = "BackupQgis/sync/pairs"
+SETTINGS_KEY = SYNC_PAIRS_KEY
 MAX_ROWS = 5000
 MODES = (("additive", "Aditivo: copia novos e alterados, nunca apaga no destino"),
          ("mirror", "Espelho: o destino fica igual à origem (removidos vão para a lixeira do destino)"),

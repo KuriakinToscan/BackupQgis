@@ -73,6 +73,24 @@ class FakeIface:
     def messageBar(self):
         return FakeBar()
 
+    menu, toolbar = [], []
+
+    def addPluginToMenu(self, name, action):
+        FakeIface.menu.append(action)
+
+    def removePluginMenu(self, name, action):
+        FakeIface.menu.remove(action)
+
+    def addToolBarIcon(self, action):
+        FakeIface.toolbar.append(action)
+
+    def removeToolBarIcon(self, action):
+        FakeIface.toolbar.remove(action)
+
+
+def as_bool_val(v):
+    return v is True or str(v).lower() in ("true", "1")
+
 
 def log(msg, *a):
     print("   log:", msg)
@@ -484,18 +502,36 @@ except Exception:
 # Automação: projectSaved e aboutToQuit reais
 # ---------------------------------------------------------------------------
 try:
-    from BackupQgis.ui.automation import Automation
+    from BackupQgis import classFactory
     vers_dest = os.path.join(BASE, "versoes_dest")
     exp_dest = os.path.join(BASE, "auto_export")
     os.makedirs(vers_dest)
     os.makedirs(exp_dest)
     s = QSettings()
     s.setValue("BackupQgis/projects/dest", vers_dest)
+    # preferências no formato da 0.3.0: o initGui migra para os grupos separados
     s.setValue("BackupQgis/auto/versionOnSave", True)
     s.setValue("BackupQgis/auto/versionKeep", 2)
     s.setValue("BackupQgis/auto/exportOnQuit", True)
     s.setValue("BackupQgis/auto/exportDir", exp_dest)
-    auto = Automation(FakeIface(), "0.3.0")
+    iface = FakeIface()
+    plugin = classFactory(iface)
+    plugin.initGui()
+    check(len(FakeIface.menu) == 2 and len(FakeIface.toolbar) == 2, "duas entradas no menu e na barra",
+          [a.text() for a in FakeIface.menu])
+    check(len(plugin.automations) == 2, "duas automações independentes", plugin.automations)
+    check(QSettings().value("BackupQgis/config/exportDir") == exp_dest
+          and as_bool_val(QSettings().value("BackupQgis/projects/versionOnSave"))
+          and not QSettings().contains("BackupQgis/auto/exportDir"), "preferências da 0.3.0 migradas")
+    FakeIface.menu[0].trigger()
+    FakeIface.menu[1].trigger()
+    win_cfg, win_proj = plugin.windows.get("config"), plugin.windows.get("projects")
+    check(win_cfg is not None and win_proj is not None and win_cfg is not win_proj, "duas janelas separadas")
+    if win_cfg is not None and win_proj is not None:
+        check(win_cfg.nav.count() == 4 and win_proj.nav.count() == 3, "páginas de cada janela",
+              (win_cfg.nav.count(), win_proj.nav.count()))
+        wait(lambda: win_cfg.scan is not None)
+    auto = plugin.automations[1]
     project = QgsProject.instance()
     project.read(qgz)
     folder = os.path.join(vers_dest, "versoes", "mapa")
@@ -507,6 +543,21 @@ try:
     wait(lambda: not auto._tasks)
     check(len(os.listdir(folder)) == 2, "retenção de versões (2)", os.listdir(folder))
 
+    # snapshot agendado (relógio zerado) sem depender da janela de configurações
+    s.setValue("BackupQgis/projects/list", json.dumps([qgz]))
+    s.setValue("BackupQgis/projects/autoSnapshot", True)
+    s.setValue("BackupQgis/projects/lastAutoSnapshot", 0)
+    auto._tick()
+    check(wait(lambda: not auto._tasks and any(d[0].isdigit() for d in os.listdir(vers_dest))),
+          "snapshot agendado gravado")
+    snaps = [d for d in os.listdir(vers_dest) if d[0].isdigit()]
+    if snaps:
+        man = json.loads(open(os.path.join(vers_dest, snaps[0], "manifest.json"), encoding="utf-8").read())
+        check(man["source"].get("trigger") == "agendado" and not man["errors"], "snapshot agendado sem erros")
+    if win_proj is not None:
+        win_proj.history_page.refresh()
+        check(win_proj.history_page.table.rowCount() == len(snaps), "histórico de snapshots na janela de projetos")
+
     QTimer.singleShot(200, app.quit)
     app.exec_()
     files = os.listdir(exp_dest)
@@ -514,7 +565,10 @@ try:
     if files:
         txt = open(os.path.join(exp_dest, files[0]), encoding="utf-8").read()
         check("segredo" not in txt, "exportação automática sem senha")
-    auto.stop()
+    from BackupQgis.ui.common import load_config_history
+    check(any(e["kind"] == "automático" for e in load_config_history()), "exportação automática no histórico")
+    plugin.unload()
+    check(not FakeIface.menu and not FakeIface.toolbar and not plugin.windows, "unload remove entradas e janelas")
 except Exception:
     check(False, "bloco automação", traceback.format_exc())
 

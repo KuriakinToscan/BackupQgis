@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Diálogo principal do BackupQgis.
+Janela "Configurações do QGIS": exportação e restauração de plugins,
+configurações, conexões e autenticação, histórico e pendências.
 
-Organização: navegação lateral (Exportar, Importar, Pendências), barra de
-mensagens do QGIS no topo e log recolhível no rodapé. Operações longas rodam
-em ``QgsTask``; a instalação de plugins roda na thread principal, um plugin
-por vez, com eventos processados entre eles.
+É independente da janela de projetos (ui/projects_dialog.py): preferências,
+log, tarefas e automação próprios. Operações longas rodam em ``QgsTask``; a
+instalação de plugins roda na thread principal, um plugin por vez.
 """
 
 import configparser
@@ -14,14 +14,11 @@ import os
 import socket
 from typing import Any, Dict, List, Optional, Tuple
 
-from qgis.core import Qgis, QgsApplication, QgsMessageLog
-from qgis.gui import QgsCollapsibleGroupBox, QgsMessageBar
-from qgis.PyQt.QtCore import QSettings, QSize, Qt
-from qgis.PyQt.QtGui import QFontDatabase, QGuiApplication, QIcon
-from qgis.PyQt.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QInputDialog,
-                                 QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
-                                 QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy,
-                                 QSpinBox, QStackedWidget, QStyle, QTabWidget, QToolButton, QVBoxLayout, QWidget)
+from qgis.core import Qgis, QgsApplication
+from qgis.PyQt.QtCore import QCoreApplication, QSettings, Qt
+from qgis.PyQt.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+                                 QLineEdit, QMenu, QMessageBox, QPushButton, QSpinBox, QStyle, QTabWidget,
+                                 QToolButton, QVBoxLayout, QWidget)
 
 from ..core import installer
 from ..core.backup_file import (BackupFormatError, build_backup_document, build_restore_plan, list_snapshots,
@@ -36,14 +33,13 @@ from ..core.settings_io import canonical, deserialize_value, read_values, serial
 from ..tasks.pip_task import PipInstallTask
 from ..tasks.scan_task import ScanTask
 from .auth_io import AuthTransferError, auth_transfer_available, authcfg_path_for, export_protected, import_authcfg
-from .common import AUTO_GROUP, source_info
+from .common import CONFIG_GROUP, add_config_history, as_bool, as_int
+from .config_history import ConfigHistoryPage
 from .preview_dialog import RestorePreviewDialog, build_preview_rows
-from .projects_page import ProjectsPage
-from .sync_page import SyncPage
+from .shell import ShellDialog
 from .widgets import CheckTable, check_item, text_item
 
 LOG_TAG = "BackupQgis"
-SETTINGS_GROUP = "BackupQgis"
 
 # Colunas das tabelas
 EXP_PLUGIN, EXP_CONFIG, EXP_NAME, EXP_KEY, EXP_VERSION, EXP_STATE = range(6)
@@ -53,10 +49,6 @@ DEP_CHECK, DEP_SOURCE, DEP_TYPE, DEP_NAME, DEP_STATE = range(5)
 
 TYPE_QGIS = "Plugin QGIS"
 TYPE_PYTHON = "Pacote Python"
-
-
-def _level(name: str) -> Any:
-    return enum_value(Qgis, "MessageLevel", name)
 
 
 def read_own_version(plugin_dir: str) -> str:
@@ -70,13 +62,15 @@ def read_own_version(plugin_dir: str) -> str:
         return "desconhecida"
 
 
-class BackupPluginDialog(QDialog):
-    """Janela principal do plugin."""
+class BackupPluginDialog(ShellDialog):
+    """Janela "Configurações do QGIS": plugins, configurações, conexões e autenticação."""
 
     def __init__(self, iface: Any, plugin_dir: str, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent if parent is not None else iface.mainWindow())
-        self.iface = iface
-        self.plugin_dir = plugin_dir
+        super().__init__(iface, plugin_dir,
+                         QCoreApplication.translate("BackupPluginDialog",
+                                                    "BackupQgis — configurações do QGIS (plugins, conexões, "
+                                                    "autenticação)"),
+                         os.path.join(plugin_dir, "icon.png"), parent)
         self.version = read_own_version(plugin_dir)
 
         self.scan = None  # ScanResult mais recente
@@ -85,9 +79,6 @@ class BackupPluginDialog(QDialog):
         self.backup_archive: Optional[str] = None
         self.backup_archive_keys: List[str] = []
         self.backup_authcfg: Optional[str] = None
-        self._tasks: List[Any] = []
-        self._busy = False
-        self._cancel_requested = False
         self._scan_started = False
 
         self._build_ui()
@@ -95,90 +86,15 @@ class BackupPluginDialog(QDialog):
     # ------------------------------------------------------------------
     # Construção da interface
     # ------------------------------------------------------------------
-    def _icon(self, theme_name: str, fallback: Optional[Any] = None) -> QIcon:
-        icon = QgsApplication.getThemeIcon(theme_name)
-        if icon.isNull() and fallback is not None:
-            icon = self.style().standardIcon(fallback)
-        return icon
-
     def _build_ui(self) -> None:
-        self.setWindowTitle(self.tr("BackupQgis — plugins, configurações, conexões, projetos e sincronização"))
-        self.setWindowIcon(QIcon(os.path.join(self.plugin_dir, "icon.png")))
-        self.resize(980, 680)
-        self.setMinimumSize(760, 520)
-
         sp = QStyle.StandardPixmap
-        self.icon_ok = self.style().standardIcon(sp.SP_DialogApplyButton)
-        self.icon_warn = self.style().standardIcon(sp.SP_MessageBoxWarning)
-        self.icon_bad = self.style().standardIcon(sp.SP_MessageBoxCritical)
-        self.icon_info = self.style().standardIcon(sp.SP_MessageBoxInformation)
-
-        root = QVBoxLayout(self)
-
-        self.message_bar = QgsMessageBar(self)
-        self.message_bar.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-        root.addWidget(self.message_bar)
-
-        body = QHBoxLayout()
-        self.nav = QListWidget(self)
-        self.nav.setIconSize(QSize(24, 24))
-        self.nav.setFixedWidth(170)
-        self.stack = QStackedWidget(self)
-        body.addWidget(self.nav)
-        body.addWidget(self.stack, 1)
-        root.addLayout(body, 1)
-
         self._add_page(self._build_export_page(), self.tr("Exportar"), self._icon("/mActionFileSave.svg", sp.SP_DialogSaveButton))
-        self._add_page(self._build_import_page(), self.tr("Importar"), self._icon("/mActionFileOpen.svg", sp.SP_DialogOpenButton))
-        self.projects_page = ProjectsPage(self)
-        self._add_page(self.projects_page, self.tr("Projetos"), self._icon("/mIconQgsProjectFile.svg", sp.SP_FileIcon))
-        self.sync_page = SyncPage(self)
-        self._add_page(self.sync_page, self.tr("Sincronizar"), self._icon("/mActionRefresh.svg", sp.SP_BrowserReload))
+        self.import_page = self._build_import_page()
+        self._add_page(self.import_page, self.tr("Importar"), self._icon("/mActionFileOpen.svg", sp.SP_DialogOpenButton))
+        self.history_page = ConfigHistoryPage(self)
+        self._add_page(self.history_page, self.tr("Histórico"), self._icon("/mActionHistory.svg", sp.SP_FileDialogDetailedView))
         self._add_page(self._build_deps_page(), self.tr("Pendências"), self._icon("/mIconWarning.svg", sp.SP_MessageBoxWarning))
-        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.nav.setCurrentRow(0)
-
-        # Rodapé: progresso, log recolhível e botões
-        progress_row = QHBoxLayout()
-        self.progress = QProgressBar(self)
-        self.progress.setVisible(False)
-        self.progress_label = QLabel("", self)
-        self.btn_cancel = QPushButton(self.tr("Cancelar"), self)
-        self.btn_cancel.setVisible(False)
-        self.btn_cancel.clicked.connect(self._request_cancel)
-        progress_row.addWidget(self.progress_label)
-        progress_row.addWidget(self.progress, 1)
-        progress_row.addWidget(self.btn_cancel)
-        root.addLayout(progress_row)
-
-        self.log_box = QgsCollapsibleGroupBox(self.tr("Log"), self)
-        self.log_box.setCollapsed(True)
-        log_layout = QVBoxLayout(self.log_box)
-        self.log_view = QPlainTextEdit(self.log_box)
-        self.log_view.setReadOnly(True)
-        self.log_view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
-        self.log_view.setMaximumBlockCount(5000)
-        self.log_view.setMaximumHeight(140)
-        log_layout.addWidget(self.log_view)
-        log_buttons = QHBoxLayout()
-        btn_copy = QPushButton(self.tr("Copiar"), self.log_box)
-        btn_copy.clicked.connect(lambda: QGuiApplication.clipboard().setText(self.log_view.toPlainText()))
-        btn_save_log = QPushButton(self.tr("Salvar..."), self.log_box)
-        btn_save_log.clicked.connect(self._save_log)
-        log_buttons.addStretch()
-        log_buttons.addWidget(btn_copy)
-        log_buttons.addWidget(btn_save_log)
-        log_layout.addLayout(log_buttons)
-        self.log_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        root.addWidget(self.log_box)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
-        buttons.rejected.connect(self.close)
-        root.addWidget(buttons)
-
-    def _add_page(self, widget: QWidget, label: str, icon: QIcon) -> None:
-        self.stack.addWidget(widget)
-        QListWidgetItem(icon, label, self.nav)
 
     def _filter_row(self, parent: QWidget, placeholder: str) -> Tuple[QHBoxLayout, QLineEdit, QToolButton]:
         row = QHBoxLayout()
@@ -240,9 +156,17 @@ class BackupPluginDialog(QDialog):
         layout.addLayout(options)
 
         auto_row = QHBoxLayout()
-        self.chk_auto_export = QCheckBox(self.tr("Exportar tudo automaticamente ao fechar o QGIS em:"), page)
-        self.chk_auto_export.setToolTip(self.tr("Grava plugins ativos, configurações, conexões e repositórios, sem "
-                                                "senhas, em qgis-config_<computador>_<data>.json."))
+        auto_label = QLabel(self.tr("Exportação automática (sem senhas):"), page)
+        auto_label.setToolTip(self.tr("Grava plugins ativos, configurações, conexões e repositórios, sem senhas, em "
+                                      "qgis-config_<computador>_<data>.json. Independe do backup de projetos."))
+        self.chk_auto_export = QCheckBox(self.tr("ao fechar o QGIS"), page)
+        self.auto_export_days = QSpinBox(page)
+        self.auto_export_days.setRange(0, 365)
+        self.auto_export_days.setPrefix(self.tr("a cada "))
+        self.auto_export_days.setSuffix(self.tr(" dia(s)"))
+        self.auto_export_days.setSpecialValueText(self.tr("sem agendamento"))
+        self.auto_export_days.setToolTip(self.tr("Exporta em segundo plano enquanto o QGIS estiver aberto "
+                                                 "(0 = desligado)."))
         self.auto_export_dir = QLineEdit(page)
         self.auto_export_dir.setPlaceholderText(self.tr("Pasta (ex.: pasta sincronizada com o NAS)"))
         browse = QToolButton(page)
@@ -252,21 +176,22 @@ class BackupPluginDialog(QDialog):
         self.auto_export_keep.setRange(0, 999)
         self.auto_export_keep.setSpecialValueText(self.tr("todos"))
         self.auto_export_keep.setToolTip(self.tr("Arquivos mantidos na pasta (0 = todos)"))
+        auto_row.addWidget(auto_label)
         auto_row.addWidget(self.chk_auto_export)
+        auto_row.addWidget(self.auto_export_days)
+        auto_row.addWidget(QLabel(self.tr("em:"), page))
         auto_row.addWidget(self.auto_export_dir, 1)
         auto_row.addWidget(browse)
         auto_row.addWidget(QLabel(self.tr("Manter:"), page))
         auto_row.addWidget(self.auto_export_keep)
         layout.addLayout(auto_row)
         settings = QSettings()
-        on_quit = settings.value(f"{AUTO_GROUP}/exportOnQuit", False)
-        self.chk_auto_export.setChecked(on_quit if isinstance(on_quit, bool) else str(on_quit).lower() in ("true", "1"))
-        self.auto_export_dir.setText(str(settings.value(f"{AUTO_GROUP}/exportDir", "")))
-        try:
-            self.auto_export_keep.setValue(int(settings.value(f"{AUTO_GROUP}/exportKeep", 10)))
-        except (TypeError, ValueError):
-            self.auto_export_keep.setValue(10)
+        self.chk_auto_export.setChecked(as_bool(settings.value(f"{CONFIG_GROUP}/exportOnQuit", False)))
+        self.auto_export_days.setValue(as_int(settings.value(f"{CONFIG_GROUP}/exportEveryDays", 0), 0))
+        self.auto_export_dir.setText(str(settings.value(f"{CONFIG_GROUP}/exportDir", "")))
+        self.auto_export_keep.setValue(as_int(settings.value(f"{CONFIG_GROUP}/exportKeep", 10), 10))
         self.chk_auto_export.toggled.connect(self._save_auto_export)
+        self.auto_export_days.valueChanged.connect(self._save_auto_export)
         self.auto_export_dir.editingFinished.connect(self._save_auto_export)
         self.auto_export_keep.valueChanged.connect(self._save_auto_export)
 
@@ -404,66 +329,6 @@ class BackupPluginDialog(QDialog):
             menu.addAction(self.tr("Desmarcar conexões visíveis"), lambda: conns.set_visible_checks(CON_CHECK, False))
 
     # ------------------------------------------------------------------
-    # Log, mensagens e estado ocupado
-    # ------------------------------------------------------------------
-    def log(self, message: str, level: str = "Info") -> None:
-        """Registra no log do diálogo e no painel de mensagens do QGIS (aba BackupQgis)."""
-        self.log_view.appendPlainText(message)
-        QgsMessageLog.logMessage(message, LOG_TAG, _level(level))
-
-    def notify(self, text: str, level: str = "Info", duration: int = 8) -> None:
-        """Mensagem não modal na barra do diálogo."""
-        title = {"Success": self.tr("Concluído"), "Warning": self.tr("Atenção"),
-                 "Critical": self.tr("Erro")}.get(level, "")
-        self.message_bar.pushMessage(title, text, _level(level), duration)
-
-    def _save_log(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, self.tr("Salvar log"), "backupqgis.log",
-                                              self.tr("Texto (*.log *.txt)"))
-        if not path:
-            return
-        try:
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(self.log_view.toPlainText())
-        except OSError as exc:
-            self.notify(str(exc), "Critical")
-
-    def _set_busy(self, busy: bool, label: str = "", cancellable: bool = False) -> None:
-        self._busy = busy
-        self._cancel_requested = False
-        self.nav.setEnabled(not busy)
-        self.stack.setEnabled(not busy)
-        self.progress.setVisible(busy)
-        self.progress_label.setText(label if busy else "")
-        self.btn_cancel.setVisible(busy and cancellable)
-        if busy:
-            self.progress.setRange(0, 0)
-
-    def _set_progress(self, done: int, total: int) -> None:
-        if total <= 0:
-            self.progress.setRange(0, 0)
-        else:
-            self.progress.setRange(0, total)
-            self.progress.setValue(done)
-
-    def _request_cancel(self) -> None:
-        self._cancel_requested = True
-        for task in list(self._tasks):
-            try:
-                task.cancel()
-            except RuntimeError:
-                pass
-        self.log(self.tr("Cancelamento solicitado."))
-
-    def _keep_task(self, task: Any) -> None:
-        self._tasks.append(task)
-        QgsApplication.taskManager().addTask(task)
-
-    def _drop_task(self, task: Any) -> None:
-        if task in self._tasks:
-            self._tasks.remove(task)
-
-    # ------------------------------------------------------------------
     # Ciclo de vida
     # ------------------------------------------------------------------
     def showEvent(self, event: Any) -> None:
@@ -471,26 +336,6 @@ class BackupPluginDialog(QDialog):
         if not self._scan_started:
             self._scan_started = True
             self.start_scan()
-
-    def closeEvent(self, event: Any) -> None:
-        if self._busy and not self._tasks:
-            # Instalação de plugins na thread principal em andamento.
-            self._request_cancel()
-            self.notify(self.tr("Aguarde o fim do plugin em instalação; o restante foi cancelado."), "Warning")
-            event.ignore()
-            return
-        super().closeEvent(event)
-
-    def shutdown(self) -> None:
-        """Chamado ao descarregar o plugin: cancela tarefas e fecha a janela."""
-        self._cancel_requested = True
-        for task in list(self._tasks):
-            try:
-                task.cancel()
-            except RuntimeError:
-                pass
-        self._tasks.clear()
-        self.close()
 
     # ------------------------------------------------------------------
     # Varredura
@@ -580,21 +425,19 @@ class BackupPluginDialog(QDialog):
 
     def _save_auto_export(self, *args: Any) -> None:
         folder = self.auto_export_dir.text().strip()
-        if self.chk_auto_export.isChecked() and not folder:
+        if (self.chk_auto_export.isChecked() or self.auto_export_days.value()) and not folder:
             self.notify(self.tr("Escolha a pasta da exportação automática."), "Warning")
         settings = QSettings()
-        settings.setValue(f"{AUTO_GROUP}/exportOnQuit", self.chk_auto_export.isChecked())
-        settings.setValue(f"{AUTO_GROUP}/exportDir", folder)
-        settings.setValue(f"{AUTO_GROUP}/exportKeep", self.auto_export_keep.value())
-
-    def _source_info(self) -> Dict[str, str]:
-        return source_info(self.iface)
+        settings.setValue(f"{CONFIG_GROUP}/exportOnQuit", self.chk_auto_export.isChecked())
+        settings.setValue(f"{CONFIG_GROUP}/exportEveryDays", self.auto_export_days.value())
+        settings.setValue(f"{CONFIG_GROUP}/exportDir", folder)
+        settings.setValue(f"{CONFIG_GROUP}/exportKeep", self.auto_export_keep.value())
 
     def _last_dir(self) -> str:
-        return str(QSettings().value(f"{SETTINGS_GROUP}/lastDir", os.path.expanduser("~")))
+        return str(QSettings().value(f"{CONFIG_GROUP}/lastDir", os.path.expanduser("~")))
 
     def _remember_dir(self, path: str) -> None:
-        QSettings().setValue(f"{SETTINGS_GROUP}/lastDir", os.path.dirname(path))
+        QSettings().setValue(f"{CONFIG_GROUP}/lastDir", os.path.dirname(path))
 
     def export_backup(self) -> None:
         """Lê os valores selecionados e grava o JSON de forma atômica."""
@@ -724,6 +567,9 @@ class BackupPluginDialog(QDialog):
             self.log(self.tr("ZIP de plugins gravado ({0}): {1}").format(len(zipped), ", ".join(zipped)), "Success")
         self.notify(self.tr("Backup gravado: {0} plugins, {1} configurações, {2} conexões.").format(
             len(plugin_keys), n_settings, len(providers)), "Success")
+        add_config_history({"path": path, "kind": "manual", "plugins": len(plugin_keys),
+                            "connections": len(providers), "secrets": secrets_mode})
+        self.history_page.refresh()
 
     def _export_plugin_zip(self, backup_path: str, plugins: List[Dict[str, Any]]) -> List[str]:
         """Grava o ZIP dos plugins que não estão em repositórios; retorna as chaves incluídas."""
@@ -764,14 +610,17 @@ class BackupPluginDialog(QDialog):
         """Abre um backup, valida e preenche as tabelas de importação."""
         path, _ = QFileDialog.getOpenFileName(self, self.tr("Abrir backup"), self._last_dir(),
                                               self.tr("Backup JSON (*.json)"))
-        if not path:
-            return
+        if path:
+            self.load_backup_path(path)
+
+    def load_backup_path(self, path: str) -> bool:
+        """Carrega ``path`` na página Importar; retorna ``True`` se o arquivo é válido."""
         try:
             doc, warnings = load_backup(path)
         except (OSError, BackupFormatError) as exc:
             self.log(self.tr("Falha ao abrir {0}: {1}").format(path, exc), "Critical")
             QMessageBox.critical(self, self.tr("Erro"), self.tr("Falha ao abrir o backup:\n{0}").format(exc))
-            return
+            return False
         self._remember_dir(path)
         self.backup_doc, self.backup_path = doc, path
         for warning in warnings:
@@ -806,6 +655,7 @@ class BackupPluginDialog(QDialog):
         self.log(self.tr("Backup carregado: {0}").format(path))
         self._fill_import_tables()
         self._update_import_buttons()
+        return True
 
     @staticmethod
     def _format_date(value: str) -> str:

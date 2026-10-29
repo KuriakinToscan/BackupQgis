@@ -61,6 +61,10 @@ def export_all(dest_dir: str, keep: int, plugin_version: str, source_info: Dict[
     host = socket.gethostname().split(".")[0] or "qgis"
     stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     path = os.path.join(dest_dir, f"{PREFIX}{host}_{stamp}.json")
+    n = 1
+    while os.path.exists(path):  # duas exportações no mesmo segundo não se sobrescrevem
+        n += 1
+        path = os.path.join(dest_dir, f"{PREFIX}{host}_{stamp}_{n}.json")
     write_json_atomic(path, doc)
     if keep > 0:
         mine = sorted(glob.glob(os.path.join(dest_dir, f"{PREFIX}{host}_*.json")))

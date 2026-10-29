@@ -116,7 +116,11 @@ with zipfile.ZipFile(qgz, "w") as z:
 from qgis.core import QgsProject
 QgsProject.instance()._file = qgz
 hd = os.path.join(base, "hd"); os.makedirs(hd)
-pp = dlg.projects_page
+from BackupQgis.ui.projects_dialog import ProjectsDialog
+pd = ProjectsDialog(FakeIface(), repo)
+pd.show(); app.processEvents()
+assert pd.nav.count() == 3 and dlg.nav.count() == 4  # janelas separadas
+pp = pd.projects_page
 pp.add_current()
 assert pp.project_paths() == [qgz]
 pp.dest.setText(hd)
@@ -134,7 +138,7 @@ src = os.path.join(base, "sig"); os.makedirs(os.path.join(src, "sub"))
 open(os.path.join(src, "a.txt"), "w").write("a")
 open(os.path.join(src, "sub", "b.txt"), "w").write("b")
 nas = os.path.join(base, "nas"); os.makedirs(nas)
-sp = dlg.sync_page
+sp = pd.sync_page
 sp.name.setText("SIG"); sp.source.setText(src); sp.dest.setText(nas)
 sp.simulate()
 assert os.path.exists(os.path.join(nas, ".backupqgis-target.json"))
@@ -175,10 +179,11 @@ assert any(f.endswith("mapa.qgz") for f in found) and any(f.endswith("base.gpkg"
 print("package/restore OK")
 
 pp.chk_version.setChecked(True)
-assert QSettings().value("BackupQgis/auto/versionOnSave") in (True, "true")
-from BackupQgis.ui.automation import Automation
+assert QSettings().value("BackupQgis/projects/versionOnSave") in (True, "true")
+from BackupQgis.ui.automation import ConfigAutomation, ProjectsAutomation
 from qgis.core import QgsProject
-auto = Automation(FakeIface(), "0.3.0")
+auto = ProjectsAutomation(FakeIface())
+cfg_auto = ConfigAutomation(FakeIface(), "0.4.0")
 QgsProject.instance().projectSaved.emit()
 versions = os.listdir(os.path.join(hd, "versoes", "mapa"))
 assert len(versions) == 1 and versions[0].startswith("mapa_") and versions[0].endswith(".qgz"), versions
@@ -187,7 +192,7 @@ exp_dir = os.path.join(base, "auto_export"); os.makedirs(exp_dir)
 QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: exp_dir)
 dlg._browse_auto_export()
 dlg.chk_auto_export.setChecked(True)
-auto._on_quit()
+cfg_auto._on_quit()
 exported = os.listdir(exp_dir)
 assert len(exported) == 1 and exported[0].startswith("qgis-config_"), exported
 assert "segredo" not in open(os.path.join(exp_dir, exported[0]), encoding="utf-8").read()
@@ -200,8 +205,46 @@ for k in auto._last_sync:
     auto._last_sync[k] -= 10 ** 6
 auto._tick()
 assert os.path.isfile(os.path.join(nas, "novo.txt"))
-auto.stop()
+# snapshot agendado e exportação agendada (relógio zerado)
+n_snaps = len([d for d in os.listdir(hd) if d[0].isdigit()])
+pp.chk_schedule.setChecked(True)
+QSettings().setValue("BackupQgis/projects/lastAutoSnapshot", 0)
+auto._tick()
+snaps_now = sorted(d for d in os.listdir(hd) if d[0].isdigit())
+assert len(snaps_now) == n_snaps + 1, snaps_now
+latest = json.load(open(os.path.join(hd, snaps_now[-1], "manifest.json"), encoding="utf-8"))
+assert latest["source"]["trigger"] == "agendado"
+dlg.auto_export_days.setValue(1)
+QSettings().setValue("BackupQgis/config/lastAutoExport", 0)
+cfg_auto._tick()
+assert len(os.listdir(exp_dir)) == 2, os.listdir(exp_dir)
+auto.stop(); cfg_auto.stop()
 print("automation OK")
+
+# históricos separados
+pd.history_page.refresh()
+assert pd.history_page.table.rowCount() == len(snaps_now), pd.history_page.table.rowCount()
+assert pd.history_page.table.item(0, 1).text() == "agendado"
+dlg.history_page.refresh()
+kinds = sorted(e.get("kind") for e in dlg.history_page.entries)
+assert kinds.count("automático") == 2 and kinds.count("manual") == 1, kinds
+manual_row = [i for i, e in enumerate(dlg.history_page.entries) if e["kind"] == "manual"][0]
+dlg.history_page.table.selectRow(manual_row)
+dlg.history_page.restore_selected()
+assert dlg.stack.currentWidget() is dlg.import_page and dlg.backup_path == out
+print("history OK")
+
+# migração das preferências da 0.3.0
+from BackupQgis.ui.common import migrate_settings
+QSettings().setValue("BackupQgis/auto/exportKeep", 7)
+QSettings().remove("BackupQgis/config/exportKeep")
+QSettings().setValue("BackupQgis/auto/versionKeep", 5)
+QSettings().remove("BackupQgis/projects/versionKeep")
+moved = migrate_settings()
+assert int(QSettings().value("BackupQgis/config/exportKeep")) == 7
+assert int(QSettings().value("BackupQgis/projects/versionKeep")) == 5
+assert not QSettings().contains("BackupQgis/auto/exportKeep") and migrate_settings() == []
+print("migration OK")
 
 # bidirecional
 other = os.path.join(base, "outro_pc"); os.makedirs(other)
@@ -221,5 +264,5 @@ print("bidirectional OK")
 from qgis.core import QgsMessageLog
 errs = [m for l, m in QgsMessageLog.msgs if l == 2 and "conectado" not in m]
 print("errors:", errs)
-dlg.shutdown()
+dlg.shutdown(); pd.shutdown()
 print("SMOKE OK")

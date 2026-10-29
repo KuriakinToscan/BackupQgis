@@ -3,7 +3,22 @@
 Plugin do QGIS para backup e restauração de **plugins**, **configurações de plugins (QSettings)**,
 **repositórios de plugins** e **conexões de provedores de dados** (WMS/WMTS, WFS/OGC API, WCS, XYZ,
 Vector Tiles, ArcGIS, STAC, PostGIS, SpatiaLite, GeoPackage, MS SQL Server, Oracle, SAP HANA) entre
-máquinas, perfis e versões do QGIS.
+máquinas, perfis e versões do QGIS, e para backup de **projetos com os dados** e sincronização de
+pastas com HD externo ou NAS.
+
+## Duas ferramentas independentes
+
+O plugin tem duas entradas no menu **Complementos › BackupQgis** e na barra de ferramentas:
+
+| | Configurações do QGIS | Projetos e dados |
+| --- | --- | --- |
+| Conteúdo | plugins, configurações, conexões, repositórios, autenticação | projetos `.qgz`/`.qgs` com os dados vinculados, pastas sincronizadas |
+| Páginas | Exportar, Importar, Histórico, Pendências | Projetos, Sincronizar, Histórico |
+| Automação | exportação ao fechar o QGIS e/ou a cada N dias | versão a cada salvamento, snapshot a cada N horas, sincronização a cada N minutos |
+| Preferências | `BackupQgis/config/*` | `BackupQgis/projects/*`, `BackupQgis/sync/*` |
+
+Cada janela tem destino, retenção, log, progresso e histórico próprios; uma operação ou automação
+não dispara nem depende da outra. Preferências da 0.3.0 são migradas automaticamente.
 
 ## O que é copiado
 
@@ -35,7 +50,7 @@ Reinicie o QGIS após restaurar para que todas as configurações tenham efeito.
 
 ## Backup de projetos
 
-A página **Projetos** inventaria projetos `.qgz`/`.qgs` **sem abri-los no QGIS** (o XML é lido
+Na janela **Projetos e dados**, a página **Projetos** inventaria projetos `.qgz`/`.qgs` **sem abri-los no QGIS** (o XML é lido
 direto) e copia para um snapshot `AAAA-MM-DD_HHMMSS` no destino:
 
 - dados de cada camada de arquivo e seus auxiliares (componentes de shapefile, `.ovr`, `.aux.xml`,
@@ -86,12 +101,17 @@ arquivo mudou dos dois lados, o mais recente vence e o outro é preservado como
 `<nome>.conflito-<máquina>-<data><ext>`; exclusões vão para a lixeira do lado correspondente. Na
 primeira execução não há exclusões, só cópias. Não tem modo automático.
 
-## Exportação automática ao fechar
+**Snapshot automático a cada N horas** faz o backup da lista de projetos em segundo plano enquanto o
+QGIS estiver aberto. O **Histórico** lista os snapshots do destino (manual ou agendado, arquivos,
+tamanho, falhas), com **Verificar integridade** (SHA-256 contra o manifesto) e **Restaurar**.
 
-Na página Exportar, a opção **Exportar tudo automaticamente ao fechar o QGIS** grava plugins
-ativos, configurações, conexões e repositórios (sem senhas) em
-`qgis-config_<máquina>_<data>.json` na pasta escolhida, mantendo os N mais recentes. Apontar para
-uma pasta sincronizada com o NAS dá um histórico de configuração sem intervenção.
+## Exportação automática das configurações
+
+Na janela **Configurações do QGIS**, página Exportar, a exportação automática grava plugins
+ativos, configurações, conexões e repositórios (sem senhas) em `qgis-config_<máquina>_<data>.json`
+na pasta escolhida, **ao fechar o QGIS** e/ou **a cada N dias**, mantendo os N mais recentes.
+Apontar para uma pasta sincronizada com o NAS dá um histórico de configuração sem intervenção. O
+**Histórico** reúne backups manuais e automáticos e abre qualquer um deles na página Importar.
 
 ## Pendências
 
@@ -117,7 +137,8 @@ gerar o `.qm` com `lrelease`.
 ```
 core/    lógica sem interface (chaves, conexões, dependências, formato, instalador)
 tasks/   QgsTask (varredura, pip)
-ui/      diálogo, prévia e componentes
+ui/      janelas (dialog: configurações; projects_dialog: projetos e dados), moldura comum (shell),
+         páginas, automações e componentes
 tests/   pytest (core sem QGIS; interface com stubs em modo offscreen)
 ```
 

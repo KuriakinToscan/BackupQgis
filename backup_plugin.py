@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Classe principal do plugin BackupQgis: registra a ação no menu e na barra de
-ferramentas e abre o diálogo.
+Classe principal do plugin BackupQgis.
+
+Registra duas entradas independentes no menu e na barra de ferramentas:
+
+- "Configurações do QGIS": plugins, configurações, conexões e autenticação;
+- "Projetos e dados": backup de projetos com os dados e sincronização de pastas.
+
+Cada uma tem janela, preferências e automação próprias.
 """
 
 import os
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 from qgis.PyQt.QtCore import QCoreApplication, QLocale, QSettings, QTranslator
 from qgis.PyQt.QtGui import QIcon
+from qgis.core import QgsApplication, QgsMessageLog
 from qgis.PyQt.QtWidgets import QAction
 
 MENU_NAME = "BackupQgis"
@@ -20,9 +27,9 @@ class BackupPlugin:
     def __init__(self, iface: Any) -> None:
         self.iface = iface
         self.plugin_dir = os.path.dirname(__file__)
-        self.action: Optional[QAction] = None
-        self.dialog = None
-        self.automation = None
+        self.actions: List[QAction] = []
+        self.windows: Dict[str, Any] = {}
+        self.automations: List[Any] = []
         self.translator: Optional[QTranslator] = None
         self._install_translator()
 
@@ -44,51 +51,80 @@ class BackupPlugin:
     def tr(self, message: str) -> str:
         return QCoreApplication.translate("BackupPlugin", message)
 
-    def initGui(self) -> None:
-        """Adiciona a ação ao menu Plugins e à barra de ferramentas de plugins."""
-        icon = QIcon(os.path.join(self.plugin_dir, "icon.png"))
-        self.action = QAction(icon, self.tr("BackupQgis: plugins, configurações e conexões..."),
-                              self.iface.mainWindow())
-        self.action.triggered.connect(self.run)
-        self.iface.addPluginToMenu(self.tr(MENU_NAME), self.action)
-        self.iface.addToolBarIcon(self.action)
+    def _add_action(self, icon: QIcon, text: str, tip: str, slot: Any) -> None:
+        action = QAction(icon, text, self.iface.mainWindow())
+        action.setToolTip(tip)
+        action.triggered.connect(slot)
+        self.iface.addPluginToMenu(self.tr(MENU_NAME), action)
+        self.iface.addToolBarIcon(action)
+        self.actions.append(action)
 
-        from .ui.automation import Automation
+    def initGui(self) -> None:
+        """Adiciona as duas entradas ao menu Plugins e à barra de ferramentas de plugins."""
+        from .ui.common import migrate_settings
+        moved = migrate_settings()
+        if moved:
+            QgsMessageLog.logMessage(f"Preferências migradas para os grupos separados: {', '.join(moved)}",
+                                     "BackupQgis")
+
+        self._add_action(QIcon(os.path.join(self.plugin_dir, "icon.png")),
+                         self.tr("Configurações do QGIS (plugins, conexões, autenticação)..."),
+                         self.tr("BackupQgis: backup e restauração das configurações do QGIS"),
+                         lambda: self.show_window("config"))
+        self._add_action(QgsApplication.getThemeIcon("/mIconQgsProjectFile.svg"),
+                         self.tr("Projetos e dados (backup e sincronização)..."),
+                         self.tr("BackupQgis: backup de projetos com os dados e sincronização de pastas"),
+                         lambda: self.show_window("projects"))
+
+        from .ui.automation import ConfigAutomation, ProjectsAutomation
         from .ui.dialog import read_own_version
-        try:
-            self.automation = Automation(self.iface, read_own_version(self.plugin_dir))
-        except Exception as exc:  # automação nunca pode impedir o carregamento do plugin
-            from qgis.core import QgsMessageLog
-            QgsMessageLog.logMessage(f"Automação desativada: {exc}", "BackupQgis")
-            self.automation = None
+        version = read_own_version(self.plugin_dir)
+        for name, factory in (("configurações", lambda: ConfigAutomation(self.iface, version)),
+                              ("projetos", lambda: ProjectsAutomation(self.iface))):
+            try:
+                self.automations.append(factory())
+            except Exception as exc:  # automação nunca pode impedir o carregamento do plugin
+                QgsMessageLog.logMessage(f"Automação de {name} desativada: {exc}", "BackupQgis")
 
     def unload(self) -> None:
-        """Remove a ação e encerra tarefas em andamento antes de o plugin ser descarregado."""
-        if self.automation is not None:
-            self.automation.stop()
-            self.automation.deleteLater()
-            self.automation = None
-        if self.action:
-            self.iface.removePluginMenu(self.tr(MENU_NAME), self.action)
-            self.iface.removeToolBarIcon(self.action)
-            self.action = None
-        if self.dialog is not None:
+        """Remove as ações e encerra tarefas em andamento antes de o plugin ser descarregado."""
+        for automation in self.automations:
             try:
-                self.dialog.shutdown()
-                self.dialog.deleteLater()
+                automation.stop()
+                automation.deleteLater()
             except RuntimeError:
                 pass
-            self.dialog = None
+        self.automations = []
+        for action in self.actions:
+            self.iface.removePluginMenu(self.tr(MENU_NAME), action)
+            self.iface.removeToolBarIcon(action)
+        self.actions = []
+        for window in self.windows.values():
+            try:
+                window.shutdown()
+                window.deleteLater()
+            except RuntimeError:
+                pass
+        self.windows = {}
         if self.translator is not None:
             QCoreApplication.removeTranslator(self.translator)
             self.translator = None
 
-    def run(self) -> None:
-        """Abre (ou traz para frente) o diálogo principal."""
-        from .ui.dialog import BackupPluginDialog
+    def show_window(self, which: str) -> None:
+        """Abre (ou traz para frente) a janela ``"config"`` ou ``"projects"``."""
+        window = self.windows.get(which)
+        if window is None:
+            if which == "config":
+                from .ui.dialog import BackupPluginDialog
+                window = BackupPluginDialog(self.iface, self.plugin_dir)
+            else:
+                from .ui.projects_dialog import ProjectsDialog
+                window = ProjectsDialog(self.iface, self.plugin_dir)
+            self.windows[which] = window
+        window.show()
+        window.raise_()
+        window.activateWindow()
 
-        if self.dialog is None:
-            self.dialog = BackupPluginDialog(self.iface, self.plugin_dir)
-        self.dialog.show()
-        self.dialog.raise_()
-        self.dialog.activateWindow()
+    def run(self) -> None:
+        """Compatibilidade: abre a janela de configurações."""
+        self.show_window("config")
