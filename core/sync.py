@@ -482,3 +482,25 @@ def save_state(path: str, state: Dict[str, StateEntry]) -> None:
     """Grava o estado de forma atômica."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     write_json_atomic(path, {"generator": "BackupQgis", "files": state})
+
+
+def run_one_way(source: str, dest: str, target_uuid: str, mode: str, excludes: Iterable[str], log: LogFn,
+                is_canceled: Callable[[], bool], progress: Callable[[int, int], None]) -> Dict[str, int]:
+    """
+    Executa uma sincronização unidirecional completa sem interação (usada na
+    automação): confere o destino, simula, aplica a trava sem forçar e executa.
+
+    :raises SyncAborted: destino ausente/errado, origem vazia ou trava acionada.
+    """
+    if mode not in ("additive", "mirror"):
+        raise SyncAborted("A sincronização automática aceita apenas os modos aditivo e espelho.")
+    check_target(dest, target_uuid)
+    if not os.path.isdir(source):
+        raise SyncAborted(f"Origem não encontrada: {source}")
+    excludes = list(excludes)
+    plan = build_plan(source, dest, scan_tree(source, excludes, is_canceled), scan_tree(dest, excludes, is_canceled),
+                      mode)
+    guard_plan(plan)
+    if plan.is_empty:
+        return {"copied": 0, "updated": 0, "trashed": 0, "failed": 0}
+    return execute_plan(plan, log, is_canceled, progress)

@@ -236,3 +236,36 @@ def apply_retention(dest_root: str, keep: int, log: LogFn) -> List[str]:
         except OSError as exc:
             log(f"Não foi possível remover {path}: {exc}")
     return removed
+
+
+def version_project_file(project_path: str, dest_root: str, keep: int, log: LogFn) -> Optional[str]:
+    """
+    Guarda uma versão datada do arquivo de projeto (sem os dados), usada no
+    salvamento automático: ``<destino>/versoes/<nome>/<nome>_AAAA-MM-DD_HHMMSS.qgz``.
+    Para .qgs, o ``.qgd`` vizinho também é copiado. Mantém as ``keep`` versões
+    mais recentes (``keep <= 0`` mantém todas).
+
+    :returns: caminho da versão gravada ou ``None`` se o destino não existir.
+    """
+    if not os.path.isdir(dest_root):
+        log(f"Versão do projeto não gravada: destino não encontrado ({dest_root}).")
+        return None
+    stem, ext = os.path.splitext(os.path.basename(project_path))
+    folder = os.path.join(dest_root, "versoes", stem)
+    stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    target = os.path.join(folder, f"{stem}_{stamp}{ext}")
+    copy_file(project_path, target)
+    qgd = os.path.splitext(project_path)[0] + ".qgd"
+    if ext.lower() == ".qgs" and os.path.isfile(qgd):
+        copy_file(qgd, os.path.splitext(target)[0] + ".qgd")
+    if keep > 0:
+        versions = sorted(f for f in os.listdir(folder)
+                          if f.startswith(stem + "_") and f.lower().endswith(ext.lower()))
+        for old in versions[: max(0, len(versions) - keep)]:
+            for path in (os.path.join(folder, old), os.path.join(folder, os.path.splitext(old)[0] + ".qgd")):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError as exc:
+                    log(f"Não foi possível remover versão antiga {path}: {exc}")
+    return target

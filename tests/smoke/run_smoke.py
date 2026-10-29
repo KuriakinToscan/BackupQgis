@@ -146,6 +146,71 @@ sp.simulate()
 assert any("conectado" in t for _l, _ti, t in QgsMessageBar.pushed[n_before:]), QgsMessageBar.pushed[n_before:]
 assert not os.path.exists(nas)
 print("sync OK")
+shutil.move(nas + "_off", nas)
+
+# ---- Fase 3: pacote, restauração, versões, bidirecional, automação ----
+pkg_out = os.path.join(base, "pacotes"); os.makedirs(pkg_out)
+QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: pkg_out)
+pp._ask = lambda title, text, buttons: "zip"
+pp.run_package()
+assert os.path.isfile(os.path.join(pkg_out, "mapa.zip")), os.listdir(pkg_out)
+with zipfile.ZipFile(os.path.join(pkg_out, "mapa.zip")) as z:
+    names = z.namelist()
+assert any(n.endswith("base.gpkg") for n in names) and any(n.endswith("mapa.qgz") for n in names), names
+
+restored = os.path.join(base, "restaurado"); os.makedirs(restored)
+snap_dir = os.path.join(hd, snaps[0])
+answers = iter([snap_dir, restored])
+QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: next(answers))
+pp._ask = lambda title, text, buttons: "new"
+pp.run_restore()
+found = [os.path.join(r, f) for r, _d, fs in os.walk(restored) for f in fs]
+assert any(f.endswith("mapa.qgz") for f in found) and any(f.endswith("base.gpkg") for f in found), found
+print("package/restore OK")
+
+pp.chk_version.setChecked(True)
+assert QSettings().value("BackupQgis/auto/versionOnSave") in (True, "true")
+from BackupQgis.ui.automation import Automation
+from qgis.core import QgsProject
+auto = Automation(FakeIface(), "0.3.0")
+QgsProject.instance().projectSaved.emit()
+versions = os.listdir(os.path.join(hd, "versoes", "mapa"))
+assert len(versions) == 1 and versions[0].startswith("mapa_") and versions[0].endswith(".qgz"), versions
+
+exp_dir = os.path.join(base, "auto_export"); os.makedirs(exp_dir)
+QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: exp_dir)
+dlg._browse_auto_export()
+dlg.chk_auto_export.setChecked(True)
+auto._on_quit()
+exported = os.listdir(exp_dir)
+assert len(exported) == 1 and exported[0].startswith("qgis-config_"), exported
+assert "segredo" not in open(os.path.join(exp_dir, exported[0]), encoding="utf-8").read()
+
+# sincronização automática de par aditivo (forçando o relógio)
+sp.auto.setChecked(True); sp.save_pair()
+open(os.path.join(src, "novo.txt"), "w").write("n")
+auto._tick()
+for k in auto._last_sync:
+    auto._last_sync[k] -= 10 ** 6
+auto._tick()
+assert os.path.isfile(os.path.join(nas, "novo.txt"))
+auto.stop()
+print("automation OK")
+
+# bidirecional
+other = os.path.join(base, "outro_pc"); os.makedirs(other)
+open(os.path.join(other, "z.txt"), "w").write("z")
+sp.new_pair()
+sp.name.setText("Bi"); sp.source.setText(src); sp.dest.setText(other)
+sp.mode.setCurrentIndex(sp.mode.findData("bidirectional"))
+assert not sp.auto.isEnabled()
+sp.simulate()
+assert sp.btn_sync.isEnabled(), sp.summary.text()
+sp.synchronize()
+assert os.path.isfile(os.path.join(src, "z.txt")) and os.path.isfile(os.path.join(other, "a.txt"))
+sp.simulate()
+assert not sp.btn_sync.isEnabled(), sp.summary.text()
+print("bidirectional OK")
 
 from qgis.core import QgsMessageLog
 errs = [m for l, m in QgsMessageLog.msgs if l == 2 and "conectado" not in m]

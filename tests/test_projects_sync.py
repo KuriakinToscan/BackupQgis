@@ -9,10 +9,10 @@ import pytest
 
 from core.file_copy import copy_file
 from core.project_backup import (BackupAborted, apply_retention, list_own_snapshots, mirror_relpath,
-                                 run_project_backup, verify_snapshot)
+                                 run_project_backup, verify_snapshot, version_project_file)
 from core.project_inventory import datasource_to_path, find_projects, inventory_project, sanitize_uri
 from core.sync import (SyncAborted, build_plan, check_target, execute_plan, guard_plan, init_marker,
-                       scan_tree)
+                       run_one_way, scan_tree)
 
 QGS = """<qgis version="3.40.0">
  <projectlayers>
@@ -273,3 +273,52 @@ def test_bidirectional_guard_empty_side(tmp_path):
     plan = build_bidirectional_plan(str(a), str(b), scan_tree(str(a)), scan_tree(str(b)), state)
     with pytest.raises(SyncAborted):
         guard_bidirectional(plan)  # B vazio depois de já ter sincronizado: HD trocado/vazio
+
+
+def test_version_project_file_keeps_latest(tmp_path, monkeypatch):
+    import core.project_backup as pb
+    proj = tmp_path / "mapa.qgs"
+    proj.write_text("<qgis/>")
+    (tmp_path / "mapa.qgd").write_bytes(b"aux")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    stamps = iter(["2026-01-01_000001", "2026-01-01_000002", "2026-01-01_000003"])
+
+    class FakeDT:
+        @staticmethod
+        def now():
+            class N:
+                def strftime(self, fmt):
+                    return next(stamps)
+            return N()
+
+    monkeypatch.setattr(pb._dt, "datetime", FakeDT)
+    for _ in range(3):
+        assert version_project_file(str(proj), str(dest), 2, lambda m: None)
+    folder = dest / "versoes" / "mapa"
+    assert sorted(os.listdir(folder)) == ["mapa_2026-01-01_000002.qgd", "mapa_2026-01-01_000002.qgs",
+                                          "mapa_2026-01-01_000003.qgd", "mapa_2026-01-01_000003.qgs"]
+
+
+def test_version_project_file_missing_dest(tmp_path):
+    proj = tmp_path / "mapa.qgz"
+    proj.write_bytes(b"x")
+    msgs = []
+    assert version_project_file(str(proj), str(tmp_path / "off"), 5, msgs.append) is None
+    assert msgs and "não encontrado" in msgs[0]
+
+
+def test_run_one_way(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (src / "a.txt").write_text("a")
+    uid = init_marker(str(dst), "teste")
+    noop = lambda *a: None  # noqa: E731
+    stats = run_one_way(str(src), str(dst), uid, "additive", [], noop, lambda: False, noop)
+    assert stats["copied"] == 1 and (dst / "a.txt").read_text() == "a"
+    assert run_one_way(str(src), str(dst), uid, "additive", [], noop, lambda: False, noop)["copied"] == 0
+    with pytest.raises(SyncAborted):
+        run_one_way(str(src), str(dst), uid, "bidirectional", [], noop, lambda: False, noop)
+    with pytest.raises(SyncAborted):
+        run_one_way(str(src), str(dst), "outro-uuid", "mirror", [], noop, lambda: False, noop)

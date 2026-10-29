@@ -5,16 +5,19 @@ Página "Projetos": inventário e backup de projetos QGIS com os dados vinculado
 
 import json
 import os
-from typing import Any, List
+from typing import Any, List, Optional, Tuple
 
 from qgis.core import QgsProject
 from qgis.PyQt.QtCore import QSettings
-from qgis.PyQt.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QPushButton, QSpinBox,
-                                 QToolButton, QVBoxLayout, QWidget)
+from qgis.PyQt.QtWidgets import (QCheckBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMessageBox,
+                                 QPushButton, QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
+from ..core.compat import enum_value
 from ..core.project_backup import apply_retention, run_project_backup
 from ..core.project_inventory import find_projects, inventory_project, summarize
+from ..core.project_package import build_package, read_manifest, restore_snapshot
 from ..tasks.function_task import FunctionTask
+from .common import AUTO_GROUP
 from .widgets import CheckTable, text_item
 
 SETTINGS_KEY = "BackupQgis/projects"
@@ -79,6 +82,28 @@ class ProjectsPage(QWidget):
         dest_row.addWidget(self.keep)
         layout.addLayout(dest_row)
 
+        extra_row = QHBoxLayout()
+        self.chk_version = QCheckBox(self.tr("Guardar versão do projeto a cada salvamento"), self)
+        self.chk_version.setToolTip(self.tr("Ao salvar qualquer projeto no QGIS, copia o .qgz/.qgs (sem os dados) "
+                                            "para <destino>/versoes/<nome>/ com data e hora."))
+        self.version_keep = QSpinBox(self)
+        self.version_keep.setRange(0, 999)
+        self.version_keep.setValue(20)
+        self.version_keep.setSpecialValueText(self.tr("todas"))
+        self.version_keep.setToolTip(self.tr("Versões mantidas por projeto (0 = todas)"))
+        self.btn_package = QPushButton(self.tr("Empacotar..."), self)
+        self.btn_package.setToolTip(self.tr("Copia o projeto e os dados para uma pasta (ou ZIP) com caminhos "
+                                            "relativos, que abre em qualquer computador."))
+        self.btn_package.clicked.connect(self.run_package)
+        self.btn_restore = QPushButton(self.tr("Restaurar snapshot..."), self)
+        self.btn_restore.clicked.connect(self.run_restore)
+        extra_row.addWidget(self.chk_version)
+        extra_row.addWidget(self.version_keep)
+        extra_row.addStretch()
+        extra_row.addWidget(self.btn_package)
+        extra_row.addWidget(self.btn_restore)
+        layout.addLayout(extra_row)
+
         self.table = CheckTable([self.tr("Projeto"), self.tr("Camada/Item"), self.tr("Tipo"), self.tr("Caminho"),
                                  self.tr("Tamanho")], 3, 0, self)
         layout.addWidget(self.table, 1)
@@ -100,6 +125,8 @@ class ProjectsPage(QWidget):
         self.projects.model().rowsRemoved.connect(self._save_settings)
         self.dest.editingFinished.connect(self._save_settings)
         self.keep.valueChanged.connect(self._save_settings)
+        self.chk_version.toggled.connect(self._save_settings)
+        self.version_keep.valueChanged.connect(self._save_settings)
 
     # ------------------------------------------------------------------
     def _load_settings(self) -> None:
@@ -113,14 +140,19 @@ class ProjectsPage(QWidget):
         self.dest.setText(str(settings.value(f"{SETTINGS_KEY}/dest", "")))
         try:
             self.keep.setValue(int(settings.value(f"{SETTINGS_KEY}/keep", 10)))
+            self.version_keep.setValue(int(settings.value(f"{AUTO_GROUP}/versionKeep", 20)))
         except (TypeError, ValueError):
             pass
+        on_save = settings.value(f"{AUTO_GROUP}/versionOnSave", False)
+        self.chk_version.setChecked(on_save if isinstance(on_save, bool) else str(on_save).lower() in ("true", "1"))
 
     def _save_settings(self, *args: Any) -> None:
         settings = QSettings()
         settings.setValue(f"{SETTINGS_KEY}/list", json.dumps(self.project_paths(), ensure_ascii=False))
         settings.setValue(f"{SETTINGS_KEY}/dest", self.dest.text().strip())
         settings.setValue(f"{SETTINGS_KEY}/keep", self.keep.value())
+        settings.setValue(f"{AUTO_GROUP}/versionOnSave", self.chk_version.isChecked())
+        settings.setValue(f"{AUTO_GROUP}/versionKeep", self.version_keep.value())
 
     def project_paths(self) -> List[str]:
         return [self.projects.item(i).text() for i in range(self.projects.count())]
@@ -255,6 +287,116 @@ class ProjectsPage(QWidget):
             self.host.notify(msg, "Success")
         if removed:
             self.host.log(self.tr("{0} snapshots antigos removidos.").format(len(removed)))
+
+    # ------------------------------------------------------------------
+    def _ask(self, title: str, text: str, buttons: List[Tuple[str, str]]) -> Optional[str]:
+        """Pergunta com botões nomeados; retorna a chave do botão escolhido ou ``None`` se cancelado."""
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setText(text)
+        mapping = {}
+        for key, label in buttons:
+            mapping[box.addButton(label, enum_value(QMessageBox, "ButtonRole", "AcceptRole"))] = key
+        box.addButton(enum_value(QMessageBox, "StandardButton", "Cancel"))
+        box.exec()
+        return mapping.get(box.clickedButton())
+
+    def run_package(self) -> None:
+        """Empacota os projetos selecionados na lista (ou todos, se nenhum estiver selecionado)."""
+        selected = [i.text() for i in self.projects.selectedItems()] or self.project_paths()
+        if not selected:
+            self.host.notify(self.tr("Adicione ao menos um projeto."), "Warning")
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, self.tr("Pasta onde o pacote será criado"))
+        if not out_dir:
+            return
+        fmt = self._ask(self.tr("Empacotar projeto"),
+                        self.tr("{0} projeto(s) serão copiados com os dados para {1}. Gerar:").format(
+                            len(selected), out_dir),
+                        [("folder", self.tr("Pasta")), ("zip", self.tr("Arquivo ZIP"))])
+        if fmt is None:
+            return
+
+        def work(task: FunctionTask) -> List[Any]:
+            results = []
+            for i, path in enumerate(selected):
+                if task.isCanceled():
+                    break
+                inv = inventory_project(path)
+                out, report = build_package(inv, out_dir, fmt == "zip", task.log, task.isCanceled,
+                                            lambda d, t, i=i: task.report(i * 1000 + (1000 * d // max(t, 1)),
+                                                                          len(selected) * 1000))
+                results.append((path, out, report, inv))
+            return results
+
+        self._start(self.tr("Empacotando projetos..."), work, self._on_package_done)
+
+    def _on_package_done(self, task: FunctionTask) -> None:
+        if not self._finish(task):
+            return
+        problems = 0
+        for path, out, report, inv in task.value:
+            self.host.log(self.tr("Pacote de {0}: {1} ({2} fontes reescritas).").format(
+                os.path.basename(path), out, report.rewritten), "Success")
+            for item in report.unresolved:
+                self.host.log(self.tr("Fonte não reescrita: {0}").format(item), "Warning")
+            problems += len(report.unresolved) + len(inv.missing) + len(inv.memory)
+        msg = self.tr("{0} pacote(s) criados.").format(len(task.value))
+        if problems:
+            self.host.notify(msg + " " + self.tr("{0} itens não incluídos ou não reescritos; veja o log.").format(
+                problems), "Warning", 0)
+        else:
+            self.host.notify(msg, "Success")
+
+    def run_restore(self) -> None:
+        """Restaura um snapshot para os caminhos originais ou para uma pasta nova."""
+        snapshot = QFileDialog.getExistingDirectory(self, self.tr("Snapshot a restaurar"), self.dest.text())
+        if not snapshot:
+            return
+        try:
+            manifest = read_manifest(snapshot)
+        except Exception as exc:  # PackageAborted: pasta errada escolhida
+            self.host.notify(str(exc), "Warning")
+            return
+        n_files = len(manifest.get("files", []))
+        mode = self._ask(
+            self.tr("Restaurar snapshot"),
+            self.tr("Snapshot de {0} com {1} arquivos e {2} projeto(s).\n\nRestaurar para:").format(
+                manifest.get("created_at", "?"), n_files, len(manifest.get("projects", []))),
+            [("new", self.tr("Pasta nova (recomendado)")), ("original", self.tr("Caminhos originais"))])
+        if mode is None:
+            return
+        target: Optional[str] = None
+        overwrite = False
+        if mode == "new":
+            target = QFileDialog.getExistingDirectory(self, self.tr("Pasta de destino da restauração"))
+            if not target:
+                return
+        else:
+            choice = self._ask(
+                self.tr("Arquivos existentes"),
+                self.tr("Arquivos idênticos são mantidos. O que fazer com arquivos que existem e são diferentes?\n"
+                        "Ao substituir, a versão atual é renomeada para *.antes-restauracao-<data>."),
+                [("keep", self.tr("Manter os atuais")), ("overwrite", self.tr("Substituir"))])
+            if choice is None:
+                return
+            overwrite = choice == "overwrite"
+
+        def work(task: FunctionTask) -> Any:
+            return restore_snapshot(snapshot, target, overwrite, task.log, task.isCanceled, task.report)
+
+        self._start(self.tr("Restaurando snapshot..."), work, self._on_restore_done)
+
+    def _on_restore_done(self, task: FunctionTask) -> None:
+        if not self._finish(task):
+            return
+        stats = task.value
+        msg = self.tr("Restauração: {0} arquivos restaurados, {1} já idênticos, {2} mantidos, {3} falhas; "
+                      "{4} projeto(s) reescritos.").format(stats["restored"], stats["skipped"], stats["kept"],
+                                                         stats["failed"], stats["projects"])
+        self.host.log(msg, "Success" if not stats["failed"] else "Warning")
+        self.host.notify(msg, "Warning" if stats["failed"] or stats["kept"] else "Success",
+                         0 if stats["failed"] else 8)
 
     # ------------------------------------------------------------------
     def _start(self, label: str, work: Any, on_done: Any) -> None:

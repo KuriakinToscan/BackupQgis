@@ -11,7 +11,6 @@ por vez, com eventos processados entre eles.
 import configparser
 import datetime
 import os
-import platform
 import socket
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,7 +21,7 @@ from qgis.PyQt.QtGui import QFontDatabase, QGuiApplication, QIcon
 from qgis.PyQt.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
                                  QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
                                  QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy,
-                                 QStackedWidget, QStyle, QTabWidget, QToolButton, QVBoxLayout, QWidget)
+                                 QSpinBox, QStackedWidget, QStyle, QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
 from ..core import installer
 from ..core.backup_file import (BackupFormatError, build_backup_document, build_restore_plan, list_snapshots,
@@ -34,6 +33,7 @@ from ..core.plugins import resolve_plugin_name
 from ..core.settings_io import canonical, deserialize_value, read_values, serialize_value, snapshot_keys
 from ..tasks.pip_task import PipInstallTask
 from ..tasks.scan_task import ScanTask
+from .common import AUTO_GROUP, source_info
 from .preview_dialog import RestorePreviewDialog, build_preview_rows
 from .projects_page import ProjectsPage
 from .sync_page import SyncPage
@@ -217,6 +217,37 @@ class BackupPluginDialog(QDialog):
         options.addWidget(self.chk_exp_secrets)
         options.addStretch()
         layout.addLayout(options)
+
+        auto_row = QHBoxLayout()
+        self.chk_auto_export = QCheckBox(self.tr("Exportar tudo automaticamente ao fechar o QGIS em:"), page)
+        self.chk_auto_export.setToolTip(self.tr("Grava plugins ativos, configurações, conexões e repositórios, sem "
+                                                "senhas, em qgis-config_<computador>_<data>.json."))
+        self.auto_export_dir = QLineEdit(page)
+        self.auto_export_dir.setPlaceholderText(self.tr("Pasta (ex.: pasta sincronizada com o NAS)"))
+        browse = QToolButton(page)
+        browse.setText("...")
+        browse.clicked.connect(self._browse_auto_export)
+        self.auto_export_keep = QSpinBox(page)
+        self.auto_export_keep.setRange(0, 999)
+        self.auto_export_keep.setSpecialValueText(self.tr("todos"))
+        self.auto_export_keep.setToolTip(self.tr("Arquivos mantidos na pasta (0 = todos)"))
+        auto_row.addWidget(self.chk_auto_export)
+        auto_row.addWidget(self.auto_export_dir, 1)
+        auto_row.addWidget(browse)
+        auto_row.addWidget(QLabel(self.tr("Manter:"), page))
+        auto_row.addWidget(self.auto_export_keep)
+        layout.addLayout(auto_row)
+        settings = QSettings()
+        on_quit = settings.value(f"{AUTO_GROUP}/exportOnQuit", False)
+        self.chk_auto_export.setChecked(on_quit if isinstance(on_quit, bool) else str(on_quit).lower() in ("true", "1"))
+        self.auto_export_dir.setText(str(settings.value(f"{AUTO_GROUP}/exportDir", "")))
+        try:
+            self.auto_export_keep.setValue(int(settings.value(f"{AUTO_GROUP}/exportKeep", 10)))
+        except (TypeError, ValueError):
+            self.auto_export_keep.setValue(10)
+        self.chk_auto_export.toggled.connect(self._save_auto_export)
+        self.auto_export_dir.editingFinished.connect(self._save_auto_export)
+        self.auto_export_keep.valueChanged.connect(self._save_auto_export)
 
         bottom = QHBoxLayout()
         self.exp_counter = QLabel("", page)
@@ -520,19 +551,24 @@ class BackupPluginDialog(QDialog):
     # ------------------------------------------------------------------
     # Exportação
     # ------------------------------------------------------------------
+    def _browse_auto_export(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, self.tr("Pasta da exportação automática"),
+                                                  self.auto_export_dir.text())
+        if folder:
+            self.auto_export_dir.setText(folder)
+            self._save_auto_export()
+
+    def _save_auto_export(self, *args: Any) -> None:
+        folder = self.auto_export_dir.text().strip()
+        if self.chk_auto_export.isChecked() and not folder:
+            self.notify(self.tr("Escolha a pasta da exportação automática."), "Warning")
+        settings = QSettings()
+        settings.setValue(f"{AUTO_GROUP}/exportOnQuit", self.chk_auto_export.isChecked())
+        settings.setValue(f"{AUTO_GROUP}/exportDir", folder)
+        settings.setValue(f"{AUTO_GROUP}/exportKeep", self.auto_export_keep.value())
+
     def _source_info(self) -> Dict[str, str]:
-        profile = ""
-        try:
-            profile = self.iface.userProfileManager().userProfile().name()
-        except Exception:
-            pass
-        return {
-            "qgis_version": str(getattr(Qgis, "QGIS_VERSION", "")),
-            "os": platform.platform(),
-            "hostname": socket.gethostname(),
-            "profile": profile,
-            "python": platform.python_version(),
-        }
+        return source_info(self.iface)
 
     def _last_dir(self) -> str:
         return str(QSettings().value(f"{SETTINGS_GROUP}/lastDir", os.path.expanduser("~")))

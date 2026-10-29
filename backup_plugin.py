@@ -22,6 +22,7 @@ class BackupPlugin:
         self.plugin_dir = os.path.dirname(__file__)
         self.action: Optional[QAction] = None
         self.dialog = None
+        self.automation = None
 
     def tr(self, message: str) -> str:
         return QCoreApplication.translate("BackupPlugin", message)
@@ -35,8 +36,21 @@ class BackupPlugin:
         self.iface.addPluginToMenu(self.tr(MENU_NAME), self.action)
         self.iface.addToolBarIcon(self.action)
 
+        from .ui.automation import Automation
+        from .ui.dialog import read_own_version
+        try:
+            self.automation = Automation(self.iface, read_own_version(self.plugin_dir))
+        except Exception as exc:  # automação nunca pode impedir o carregamento do plugin
+            from qgis.core import QgsMessageLog
+            QgsMessageLog.logMessage(f"Automação desativada: {exc}", "BackupQgis")
+            self.automation = None
+
     def unload(self) -> None:
         """Remove a ação e encerra tarefas em andamento antes de o plugin ser descarregado."""
+        if self.automation is not None:
+            self.automation.stop()
+            self.automation.deleteLater()
+            self.automation = None
         if self.action:
             self.iface.removePluginMenu(self.tr(MENU_NAME), self.action)
             self.iface.removeToolBarIcon(self.action)

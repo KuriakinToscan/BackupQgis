@@ -9,11 +9,14 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from qgis.PyQt.QtCore import QSettings
-from qgis.PyQt.QtWidgets import (QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                                 QMessageBox, QPushButton, QToolButton, QVBoxLayout, QWidget)
+from qgis.PyQt.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
+                                 QListWidget, QMessageBox, QPushButton, QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
-from ..core.sync import (SyncAborted, build_plan, check_target, default_excludes_text, execute_plan, guard_plan,
-                         init_marker, parse_excludes, read_marker, scan_tree)
+from ..core.file_copy import sha256_file
+from ..core.sync import (BiPlan, SyncAborted, build_bidirectional_plan, build_plan, build_state, check_target,
+                         default_excludes_text, execute_bidirectional, execute_plan, guard_bidirectional, guard_plan,
+                         init_marker, load_state, parse_excludes, read_marker, save_state, scan_tree)
+from .common import sync_state_path
 from ..tasks.function_task import FunctionTask
 from .projects_page import human_size
 from .widgets import CheckTable, text_item
@@ -21,7 +24,9 @@ from .widgets import CheckTable, text_item
 SETTINGS_KEY = "BackupQgis/sync/pairs"
 MAX_ROWS = 5000
 MODES = (("additive", "Aditivo: copia novos e alterados, nunca apaga no destino"),
-         ("mirror", "Espelho: o destino fica igual à origem (removidos vão para a lixeira do destino)"))
+         ("mirror", "Espelho: o destino fica igual à origem (removidos vão para a lixeira do destino)"),
+         ("bidirectional", "Bidirecional (experimental): leva alterações nos dois sentidos; conflitos preservam "
+                           "as duas versões"))
 
 
 class SyncPage(QWidget):
@@ -73,6 +78,18 @@ class SyncPage(QWidget):
         form.addRow(self.tr("Destino:"), self._with_browse(self.dest))
         form.addRow(self.tr("Modo:"), self.mode)
         form.addRow(self.tr("Excluir:"), self.excludes)
+        auto_row = QHBoxLayout()
+        self.auto = QCheckBox(self.tr("Sincronizar automaticamente a cada"), form_box)
+        self.auto.setToolTip(self.tr("Somente modos aditivo e espelho. Com o destino desconectado, a execução é "
+                                     "ignorada e registrada no log."))
+        self.interval = QSpinBox(form_box)
+        self.interval.setRange(5, 1440)
+        self.interval.setValue(60)
+        self.interval.setSuffix(self.tr(" min"))
+        auto_row.addWidget(self.auto)
+        auto_row.addWidget(self.interval)
+        auto_row.addStretch()
+        form.addRow("", auto_row)
         form.addRow(self.tr("Situação:"), self.target_status)
         btn_save = QPushButton(self.tr("Salvar par"), form_box)
         btn_save.clicked.connect(self.save_pair)
@@ -100,6 +117,7 @@ class SyncPage(QWidget):
         for widget in (self.source, self.dest, self.excludes):
             widget.textEdited.connect(self._invalidate_plan)
         self.mode.currentIndexChanged.connect(self._invalidate_plan)
+        self.mode.currentIndexChanged.connect(self._update_auto_enabled)
         self._refresh_list()
         if not self.pairs:
             self.new_pair()
@@ -159,8 +177,18 @@ class SyncPage(QWidget):
         idx = self.mode.findData(pair.get("mode", "additive"))
         self.mode.setCurrentIndex(max(0, idx))
         self.excludes.setText(pair.get("excludes", default_excludes_text()))
+        self.auto.setChecked(bool(pair.get("auto", False)))
+        self.interval.setValue(int(pair.get("interval", 60) or 60))
+        self._update_auto_enabled()
         self._invalidate_plan()
         self._update_target_status(pair)
+
+    def _update_auto_enabled(self, *args: Any) -> None:
+        one_way = self.mode.currentData() in ("additive", "mirror")
+        self.auto.setEnabled(one_way)
+        self.interval.setEnabled(one_way)
+        if not one_way:
+            self.auto.setChecked(False)
 
     def _update_target_status(self, pair: Dict[str, Any]) -> None:
         dest = pair.get("dest", "")
@@ -221,7 +249,9 @@ class SyncPage(QWidget):
         if pair.get("dest") and os.path.normcase(pair["dest"]) != os.path.normcase(dest):
             pair["target_uuid"] = ""
         pair.update(name=self.name.text().strip() or os.path.basename(source.rstrip("/\\")), source=source, dest=dest,
-                    mode=self.mode.currentData(), excludes=self.excludes.text())
+                    mode=self.mode.currentData(), excludes=self.excludes.text(),
+                    auto=self.auto.isChecked() and self.mode.currentData() in ("additive", "mirror"),
+                    interval=self.interval.value())
         if os.path.isdir(dest) and not pair.get("target_uuid"):
             marker = read_marker(dest)
             text = (self.tr("O destino já tem um marcador do BackupQgis. Usá-lo para este par?") if marker else
@@ -258,6 +288,13 @@ class SyncPage(QWidget):
             task.report(50, 100)
             task.log(f"Lendo destino {pair['dest']}...")
             dst_tree = scan_tree(pair["dest"], excludes, task.isCanceled)
+            if pair["mode"] == "bidirectional":
+                def same(rel: str) -> bool:
+                    a = os.path.join(pair["source"], *rel.split("/"))
+                    b = os.path.join(pair["dest"], *rel.split("/"))
+                    return sha256_file(a, task.isCanceled) == sha256_file(b, task.isCanceled)
+                return build_bidirectional_plan(pair["source"], pair["dest"], src_tree, dst_tree,
+                                                load_state(sync_state_path(pair["id"])), same_content=same)
             return build_plan(pair["source"], pair["dest"], src_tree, dst_tree, pair["mode"])
 
         self._start(self.tr("Simulando sincronização..."), work,
@@ -267,6 +304,9 @@ class SyncPage(QWidget):
         if not self._finish(task):
             return
         plan = task.value
+        if isinstance(plan, BiPlan):
+            self._show_bidirectional(plan, pair_id)
+            return
         rows, ids = [], []
         labels = ((self.tr("Copiar (novo)"), plan.copy_new, None),
                   (self.tr("Atualizar"), plan.update, None),
@@ -297,11 +337,70 @@ class SyncPage(QWidget):
         if plan.is_empty:
             self.host.notify(self.tr("Origem e destino já estão sincronizados."), "Success")
 
+    def _show_bidirectional(self, plan: BiPlan, pair_id: str) -> None:
+        rows, ids = [], []
+        groups = ((self.tr("Origem → destino"), plan.a_to_b, None),
+                  (self.tr("Destino → origem"), plan.b_to_a, None),
+                  (self.tr("Lixeira da origem"), plan.delete_a, self.host.icon_warn),
+                  (self.tr("Lixeira do destino"), plan.delete_b, self.host.icon_warn))
+        for action, items, icon in groups:
+            for rel in items[:MAX_ROWS]:
+                rows.append([text_item(action, icon), text_item(rel), text_item("")])
+                ids.append(rel)
+        for rel, winner in plan.conflicts[:MAX_ROWS]:
+            label = self.tr("Conflito (vence a origem)") if winner == "a" else self.tr("Conflito (vence o destino)")
+            rows.append([text_item(label, self.host.icon_bad), text_item(rel), text_item("")])
+            ids.append(rel)
+        self.table.set_rows(rows, ids)
+        text = self.tr("{0} para o destino, {1} para a origem, {2} para as lixeiras, {3} conflitos; {4} a copiar.").format(
+            len(plan.a_to_b), len(plan.b_to_a), len(plan.delete_a) + len(plan.delete_b), len(plan.conflicts),
+            human_size(plan.bytes_to_copy))
+        if plan.first_run:
+            text += " " + self.tr("Primeira execução: nada será apagado; arquivos de um lado só são copiados.")
+        self.summary.setText(text)
+        self.host.log(self.tr("Simulação bidirecional: ") + text)
+        self.plan, self.plan_pair_id = plan, pair_id
+        self.btn_sync.setEnabled(not plan.is_empty)
+        if plan.is_empty:
+            self.host.notify(self.tr("Origem e destino já estão sincronizados."), "Success")
+
+    def _synchronize_bidirectional(self, pair: Dict[str, Any], plan: BiPlan) -> None:
+        force = False
+        try:
+            guard_bidirectional(plan)
+        except SyncAborted as exc:
+            if plan.a_count == 0 or plan.b_count == 0:
+                self.host.notify(str(exc), "Critical")
+                return
+            answer = QMessageBox.warning(
+                self, self.tr("Muitos arquivos serão removidos"),
+                str(exc) + "\n\n" + self.tr("Os arquivos irão para a lixeira de cada lado. Continuar mesmo assim?"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            force = True
+        target_uuid = pair.get("target_uuid", "")
+        excludes = parse_excludes(pair.get("excludes", ""))
+        state_path = sync_state_path(pair["id"])
+
+        def work(task: FunctionTask) -> Any:
+            check_target(plan.b, target_uuid)
+            guard_bidirectional(plan, force=force)
+            stats = execute_bidirectional(plan, task.log, task.isCanceled, task.report)
+            save_state(state_path, build_state(scan_tree(plan.a, excludes), scan_tree(plan.b, excludes)))
+            return {"copied": stats["a_to_b"] + stats["b_to_a"], "updated": stats["conflicts"],
+                    "trashed": stats["trashed"], "failed": stats["failed"]}
+
+        self._start(self.tr("Sincronizando nos dois sentidos..."), work, self._on_synced)
+
     def synchronize(self) -> None:
         pair = self._current()
         plan = self.plan
         if plan is None or pair is None or pair["id"] != self.plan_pair_id:
             self.host.notify(self.tr("Simule antes de sincronizar."), "Warning")
+            return
+        if isinstance(plan, BiPlan):
+            self._synchronize_bidirectional(pair, plan)
             return
         force = False
         try:

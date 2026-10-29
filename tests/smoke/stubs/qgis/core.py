@@ -23,6 +23,10 @@ class QgsApplication:
     _tm = _TM()
     @staticmethod
     def taskManager(): return QgsApplication._tm
+    @staticmethod
+    def instance():
+        from PyQt5.QtWidgets import QApplication
+        return QApplication.instance()
 class QgsTask(QObject):
     progressChanged = pyqtSignal(float)
     class Flag:
@@ -32,9 +36,11 @@ class QgsTask(QObject):
     def setProgress(self, p): self.progressChanged.emit(float(p))
     def isCanceled(self): return self._c
     def cancel(self): self._c = True
-class QgsProject:
+class QgsProject(QObject):
+    projectSaved = pyqtSignal()
     _inst = None
-    def __init__(self): self._file = os.environ.get("SMOKE_PROJECT", ""); self._dirty = False
+    def __init__(self):
+        super().__init__(); self._file = os.environ.get("SMOKE_PROJECT", ""); self._dirty = False
     @staticmethod
     def instance():
         if QgsProject._inst is None: QgsProject._inst = QgsProject()
