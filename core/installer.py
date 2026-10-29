@@ -60,11 +60,25 @@ def resolve_repository_key(name_or_key: str, available: Dict[str, Dict]) -> Opti
     return None
 
 
+def home_plugin_path() -> str:
+    """
+    Pasta de plugins do perfil atual. ``qgis.utils.home_plugin_path`` só é
+    definido quando a interface do QGIS inicializa o Python; fora disso
+    (scripts, testes) usa ``<perfil>/python/plugins``.
+    """
+    import qgis.utils
+    home = getattr(qgis.utils, "home_plugin_path", "")
+    if home:
+        return home
+    from qgis.core import QgsApplication
+    return os.path.join(QgsApplication.qgisSettingsDirPath(), "python", "plugins")
+
+
 def _is_installed(key: str) -> bool:
     import qgis.utils
     if key in getattr(qgis.utils, "available_plugins", []):
         return True
-    home = getattr(qgis.utils, "home_plugin_path", "")
+    home = home_plugin_path()
     return bool(home) and os.path.isfile(os.path.join(home, key, "metadata.txt"))
 
 
@@ -128,10 +142,7 @@ def install_from_archive(key: str, archive: str, log: LogFn) -> bool:
     import qgis.utils
     from .plugin_archive import PluginArchiveError, extract_plugin
 
-    home = getattr(qgis.utils, "home_plugin_path", "")
-    if not home:
-        log(f"Impossível instalar '{key}' do ZIP: pasta de plugins do perfil desconhecida.")
-        return False
+    home = home_plugin_path()
     try:
         path = extract_plugin(archive, key, home)
     except (OSError, PluginArchiveError) as exc:

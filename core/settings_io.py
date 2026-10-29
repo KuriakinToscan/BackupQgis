@@ -10,6 +10,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from qgis.PyQt.QtCore import (QByteArray, QDate, QDateTime, QPoint, QRect, QSettings, QSize, Qt,
                               QTime)
 
+try:  # PyQt6 pode não expor QVariant
+    from qgis.PyQt.QtCore import QVariant
+except ImportError:  # pragma: no cover
+    QVariant = None
+
 SerializedValue = Dict[str, Any]
 
 
@@ -25,6 +30,12 @@ def serialize_value(val: Any, fallbacks: Optional[List[str]] = None, key: str = 
     """
     if val is None:
         return {"type": "basic", "value": None}
+    if _is_qvariant(val):
+        # O QGIS grava campos vazios (ex.: service/authcfg das conexões PostGIS) como QVariant nulo.
+        # Gravá-los como o texto "NULL" quebra a conexão restaurada.
+        if val.isNull() or not val.isValid():
+            return {"type": "null", "value": None}
+        return serialize_value(val.value(), fallbacks, key)
     if isinstance(val, (bool, int, float, str)):
         return {"type": "basic", "value": val}
     if isinstance(val, (QByteArray, bytes, bytearray)):
@@ -52,6 +63,11 @@ def serialize_value(val: Any, fallbacks: Optional[List[str]] = None, key: str = 
     return {"type": "fallback", "value": str(val), "pytype": type(val).__name__}
 
 
+def _is_qvariant(val: Any) -> bool:
+    """``True`` para ``QVariant`` (PyQGIS devolve QVariant nulo para valores vazios)."""
+    return QVariant is not None and isinstance(val, QVariant)
+
+
 def deserialize_value(data: Any) -> Any:
     """
     Reverte :func:`serialize_value`.
@@ -67,6 +83,8 @@ def deserialize_value(data: Any) -> Any:
     try:
         if kind == "basic":
             return val
+        if kind == "null" or (kind == "fallback" and data.get("pytype") == "QVariant" and val == "NULL"):
+            return None  # o segundo caso corrige backups gerados pela 0.2.0
         if kind == "bytearray":
             return QByteArray(base64.b64decode(val.encode("ascii")))
         if kind == "datetime":

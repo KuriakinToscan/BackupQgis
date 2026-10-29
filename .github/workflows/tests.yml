@@ -25,3 +25,20 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest -q tests
+
+  qgis-real:
+    # Integração com QGIS real (pacote python3-qgis do Ubuntu 24.04, QGIS 3.34 LTR), sem stubs.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar QGIS
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            python3-qgis qgis-providers python3-pyqt5 python3-gdal
+      - name: Teste de integração
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          export HOME="$(mktemp -d)"
+          /usr/bin/python3 -W ignore tests/qgis_real/run_real.py

@@ -41,6 +41,7 @@ PROVIDER_LABELS = {
     "xyz": "XYZ Tiles",
     "vectortile": "Vector Tiles",
     "vectortiles": "Vector Tiles",
+    "vector-tile": "Vector Tiles",
     "arcgismapserver": "ArcGIS MapServer",
     "arcgis-mapserver": "ArcGIS MapServer",
     "arcgisfeatureserver": "ArcGIS FeatureServer",

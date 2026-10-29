@@ -119,6 +119,12 @@ tests/   pytest (core sem QGIS; interface com stubs em modo offscreen)
 
 Testes: `pip install pytest PyQt5 && QT_QPA_PLATFORM=offscreen python -m pytest tests`.
 
+Integração com QGIS real (sem stubs; no CI roda com o QGIS 3.34 LTR do Ubuntu 24.04):
+`HOME=$(mktemp -d) QT_QPA_PLATFORM=offscreen python3 tests/qgis_real/run_real.py`. Cobre projetos
+gravados pelo QGIS (inventário, pacote movido e snapshot restaurado reabertos com camadas válidas),
+conexões criadas pela API e pela árvore 3.30+, exportação/restauração pelo diálogo, authcfg com
+senha mestra, instalação de plugin pelo ZIP e os sinais `projectSaved`/`aboutToQuit`.
+
 Para gerar o ZIP do plugin sem testes: `git archive --prefix=BackupQgis/ -o BackupQgis.zip HEAD`.
 
 ## Licença

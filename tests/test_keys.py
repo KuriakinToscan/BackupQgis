@@ -78,3 +78,15 @@ def test_remap_path_prefix():
     assert remap_path_prefix(["C:/Users/ana/a", 3], "C:/Users/ana", "/h") == ["/h/a", 3]
     assert remap_path_prefix("D:/x", "C:/Users/ana", "/h") == "D:/x"
     assert remap_path_prefix(5, "a", "b") == 5
+
+
+def test_qgis334_tree_labels():
+    # Chaves reais gravadas pelo QGIS 3.34 (árvore connections/<tipo>/items/<nome>/...)
+    from core.keys import group_connection_keys
+    keys = ["connections/vector-tile/items/VT/url",
+            "connections/ows/items/wms/connections/items/IBGE WMS/url",
+            "connections/xyz/items/OSM BR/http-header",
+            "connections/arcgisfeatureserver/items/Arc/url"]
+    groups = group_connection_keys(keys)
+    assert set(groups) == {("Vector Tiles", "VT"), ("WMS / WMTS", "IBGE WMS"), ("XYZ Tiles", "OSM BR"),
+                           ("ArcGIS FeatureServer", "Arc")}

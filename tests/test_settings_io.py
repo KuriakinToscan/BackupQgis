@@ -32,3 +32,12 @@ def test_canonical_is_order_independent():
 
 def test_corrupt_value_does_not_raise():
     assert deserialize_value({"type": "point", "value": ["x"]}) is None
+
+
+def test_null_qvariant_roundtrip():
+    from PyQt5.QtCore import QVariant
+    assert serialize_value(QVariant()) == {"type": "null", "value": None}
+    assert deserialize_value({"type": "null", "value": None}) is None
+    # backups da 0.2.0 gravaram QVariant nulo como o texto "NULL"
+    assert deserialize_value({"type": "fallback", "value": "NULL", "pytype": "QVariant"}) is None
+    assert serialize_value(QVariant("abc")) == {"type": "basic", "value": "abc"}
