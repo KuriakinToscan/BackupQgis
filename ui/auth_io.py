@@ -44,11 +44,29 @@ def auth_transfer_available() -> bool:
     return _manager() is not None
 
 
+DISABLED_MESSAGE = ("O gerenciador de autenticação do QGIS está desabilitado nesta sessão (a senha mestra falhou "
+                    "5 vezes). Feche e abra o QGIS para tentar de novo; nada foi alterado no banco de autenticação.")
+
+
+def auth_disabled() -> bool:
+    """``True`` se o QGIS desabilitou o gerenciador de autenticação nesta sessão."""
+    manager = _manager()
+    return bool(manager is not None and hasattr(manager, "isDisabled") and manager.isDisabled())
+
+
 def _unlock(manager: Any) -> None:
-    """Pede a senha mestra (diálogo do QGIS) se o banco estiver bloqueado."""
+    """
+    Pede a senha mestra uma única vez (diálogo do próprio QGIS) se o banco
+    estiver bloqueado. Nunca repete a tentativa: o QGIS desabilita o
+    gerenciador após 5 falhas na sessão.
+    """
+    if hasattr(manager, "isDisabled") and manager.isDisabled():
+        raise AuthTransferError(DISABLED_MESSAGE)
     if hasattr(manager, "masterPasswordIsSet") and manager.masterPasswordIsSet():
         return
     if hasattr(manager, "setMasterPassword") and not manager.setMasterPassword(True):
+        if hasattr(manager, "isDisabled") and manager.isDisabled():
+            raise AuthTransferError(DISABLED_MESSAGE)
         raise AuthTransferError("Senha mestra de autenticação não informada ou incorreta.")
 
 
@@ -76,15 +94,16 @@ def export_authcfg(path: str, password: str, log: LogFn) -> int:
     return len(ids)
 
 
-def export_protected(path: str, password: str, credentials: List[Credential], log: LogFn
-                     ) -> Tuple[Dict[str, str], int]:
+def export_protected(path: str, password: str, credentials: List[Credential], referenced: List[str],
+                     log: LogFn) -> Tuple[Dict[str, str], int]:
     """
-    Exporta o banco de autenticação incluindo as senhas das conexões.
+    Exporta as autenticações usadas pelas conexões selecionadas.
 
     Para cada senha sem authcfg, cria uma configuração Basic temporária
-    ("BackupQgis: <conexão>") com usuário e senha, exporta todas as
-    configurações para ``path`` (criptografado com ``password``) e remove as
-    temporárias do banco local, que continua como estava.
+    ("BackupQgis: <conexão>") com usuário e senha; exporta essas e as já
+    referenciadas pelas conexões (``referenced``) para ``path``, criptografado
+    com ``password``, e remove as temporárias do banco local, que continua
+    como estava. Sem nada a exportar, não toca na senha mestra.
 
     :returns: (``{chave de senha: id criado}``, quantidade de configurações exportadas).
     :raises AuthTransferError: recurso indisponível, senha vazia ou falha do QGIS.
@@ -94,6 +113,8 @@ def export_protected(path: str, password: str, credentials: List[Credential], lo
     manager = _manager()
     if manager is None:
         raise AuthTransferError("Esta versão do QGIS não exporta configurações de autenticação (requer 3.20+).")
+    if not credentials and not referenced:
+        return {}, 0
     if not password:
         raise AuthTransferError("Informe uma senha para proteger o arquivo de autenticação.")
     _unlock(manager)
@@ -111,7 +132,11 @@ def export_protected(path: str, password: str, credentials: List[Credential], lo
             if not ok or not cfg.id():
                 raise AuthTransferError(f"Não foi possível criar a autenticação de {cred.connection}.")
             created[cred.password_key] = cfg.id()
-        ids = list(manager.configIds())
+        existing = set(manager.configIds())
+        missing = [r for r in referenced if r not in existing]
+        if missing:
+            log(f"Autenticações referenciadas que não existem nesta máquina (ignoradas): {', '.join(missing)}")
+        ids = sorted({r for r in referenced if r in existing} | set(created.values()))
         if not ids:
             return created, 0
         if not manager.exportAuthenticationConfigsToXml(path, ids, password):
@@ -135,7 +160,7 @@ def import_authcfg(path: str, password: str, overwrite: bool, log: LogFn) -> Non
     manager = _manager()
     if manager is None:
         raise AuthTransferError("Esta versão do QGIS não importa configurações de autenticação (requer 3.20+).")
-    _unlock(manager)
+    _unlock(manager)  # verifica também se o gerenciador foi desabilitado
     if not manager.importAuthenticationConfigsFromXml(path, password, overwrite):
         raise AuthTransferError("Falha ao importar (senha incorreta ou arquivo inválido).")
     log(f"Configurações de autenticação importadas de {path}.")

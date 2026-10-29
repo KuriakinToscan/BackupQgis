@@ -465,6 +465,64 @@ except Exception:
     check(False, "bloco senhas protegidas", traceback.format_exc())
 
 # ---------------------------------------------------------------------------
+# Modo protegido sem senhas nas conexões e gerenciador desabilitado (caso do Windows)
+# ---------------------------------------------------------------------------
+try:
+    from BackupQgis.ui import auth_io as A
+    tree["/connections/xyz/items/%1/url"].setVariantValue("https://livre/{z}/{x}/{y}.png", ["XYZ livre"])
+    QSettings().sync()
+    prompts = []
+    QInputDialog.getText = staticmethod(lambda *a, **k: (prompts.append(a) or ("senhaDoArquivo", True)))
+    QMessageBox.critical = staticmethod(lambda *a, **k: None)
+
+    def only(dlg_, name):
+        dlg_.exp_filter.setText("")
+        dlg_.exp_conns.set_visible_checks(D.CON_CHECK, False)
+        dlg_.exp_filter.setText(name)
+        dlg_.exp_conns.set_visible_checks(D.CON_CHECK, True)
+
+    dlg4 = D.BackupPluginDialog(FakeIface(), REPO)
+    dlg4.show()
+    wait(lambda: dlg4.scan is not None)
+    dlg4.cmb_secrets.setCurrentIndex(dlg4.cmb_secrets.findData("authcfg"))
+    only(dlg4, "XYZ livre")
+    out_x = os.path.join(BASE, "so_xyz.json")
+    QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (out_x, ""))
+    dlg4.export_backup()
+    check(os.path.isfile(out_x), "XYZ sem senha: backup gravado no modo protegido")
+    check(not prompts, "XYZ sem senha: nenhuma senha pedida", prompts)
+    check(not os.path.exists(os.path.join(BASE, "so_xyz.authcfg.xml")), "XYZ sem senha: sem arquivo de autenticação")
+
+    class DisabledManager:
+        def isDisabled(self):
+            return True
+
+        def exportAuthenticationConfigsToXml(self, *a):
+            raise AssertionError("não deveria exportar")
+
+        def setMasterPassword(self, *a):
+            raise AssertionError("não deveria pedir a senha mestra")
+
+    real_manager = A._manager
+    A._manager = lambda: DisabledManager()
+    D.auth_disabled = A.auth_disabled
+    try:
+        only(dlg4, "PG senha")
+        out_d = os.path.join(BASE, "desabilitado.json")
+        QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (out_d, ""))
+        dlg4.log_view.clear()
+        dlg4.export_backup()
+        check(not os.path.exists(out_d), "gerenciador desabilitado: backup com senha não gravado")
+        check(not prompts, "gerenciador desabilitado: nenhuma senha pedida", prompts)
+        check("desabilitado" in dlg4.log_view.toPlainText() and "abra o QGIS" in dlg4.log_view.toPlainText(),
+              "gerenciador desabilitado: mensagem orienta reiniciar", dlg4.log_view.toPlainText())
+    finally:
+        A._manager = real_manager
+    dlg4.shutdown()
+except Exception:
+    check(False, "bloco senha mestra", traceback.format_exc())
+
+# ---------------------------------------------------------------------------
 # ZIP de plugins: extração e carga real
 # ---------------------------------------------------------------------------
 try:

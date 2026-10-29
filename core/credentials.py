@@ -89,3 +89,8 @@ def apply_authcfg(values: Dict[str, Any], credentials: List[Credential], ids: Di
         if new_id:
             out[cred.authcfg_key] = {"type": "basic", "value": new_id}
     return out, removed
+
+
+def referenced_authcfg(values: Dict[str, Any]) -> List[str]:
+    """Ids de authcfg já usados pelas chaves ``.../authcfg`` não vazias de uma conexão."""
+    return sorted({_plain(v) for k, v in values.items() if k.rsplit("/", 1)[-1].lower() == "authcfg" and _plain(v)})

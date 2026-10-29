@@ -24,7 +24,7 @@ from ..core import installer
 from ..core.backup_file import (BackupFormatError, build_backup_document, build_restore_plan, list_snapshots,
                                 load_backup, load_snapshot, save_snapshot, snapshot_dir, write_json_atomic)
 from ..core.compat import enum_value
-from ..core.credentials import Credential, apply_authcfg, find_credentials
+from ..core.credentials import Credential, apply_authcfg, find_credentials, referenced_authcfg
 from ..core.deps import find_python_interpreter, is_distribution_installed, read_plugin_dependencies
 from ..core.keys import is_sensitive_key, remap_path_prefix
 from ..core.plugin_archive import PluginArchiveError, archive_keys, archive_path_for, write_plugins_archive
@@ -32,7 +32,8 @@ from ..core.plugins import resolve_plugin_name
 from ..core.settings_io import canonical, deserialize_value, read_values, serialize_value, snapshot_keys
 from ..tasks.pip_task import PipInstallTask
 from ..tasks.scan_task import ScanTask
-from .auth_io import AuthTransferError, auth_transfer_available, authcfg_path_for, export_protected, import_authcfg
+from .auth_io import (DISABLED_MESSAGE, AuthTransferError, auth_disabled, auth_transfer_available, authcfg_path_for,
+                      export_protected, import_authcfg)
 from .common import CONFIG_GROUP, add_config_history, as_bool, as_int
 from .config_history import ConfigHistoryPage
 from .preview_dialog import RestorePreviewDialog, build_preview_rows
@@ -466,13 +467,6 @@ class BackupPluginDialog(ShellDialog):
             return
         if not path.lower().endswith(".json"):
             path += ".json"
-        file_pwd: Optional[str] = None
-        if secrets_mode == "authcfg":
-            file_pwd = self._ask_password(self.tr("Proteger senhas"), confirm=True)
-            if file_pwd is None:
-                self.notify(self.tr("Exportação cancelada: a senha do arquivo de autenticação é necessária para "
-                                    "incluir as senhas."), "Warning")
-                return
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -511,7 +505,23 @@ class BackupPluginDialog(ShellDialog):
             converted: List[str] = []
             n_auth = 0
             if secrets_mode == "authcfg":
-                ids, n_auth = export_protected(authcfg_path_for(path), file_pwd or "", credentials, self.log)
+                refs = sorted({r for prov in providers for r in referenced_authcfg(prov["keys"])})
+                ids: Dict[str, str] = {}
+                if (credentials or refs) and auth_disabled():
+                    raise AuthTransferError(DISABLED_MESSAGE)
+                if credentials or refs:
+                    # Só aqui, e só se houver o que proteger, pede senha do arquivo e (via QGIS) a senha mestra.
+                    QApplication.restoreOverrideCursor()
+                    file_pwd = self._ask_password(self.tr("Proteger senhas"), confirm=True)
+                    if file_pwd is None:
+                        self.notify(self.tr("Exportação cancelada: a senha do arquivo de autenticação é necessária "
+                                            "para incluir as senhas."), "Warning")
+                        return
+                    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+                    ids, n_auth = export_protected(authcfg_path_for(path), file_pwd, credentials, refs, self.log)
+                else:
+                    self.log(self.tr("As conexões selecionadas não têm senha nem authcfg: o arquivo de "
+                                     "autenticação não é necessário e a senha mestra não foi solicitada."))
                 for prov in providers:
                     values, removed = apply_authcfg(prov["keys"], prov["_creds"], ids)
                     converted += removed
@@ -834,6 +844,11 @@ class BackupPluginDialog(ShellDialog):
         self.start_scan()
 
     def _import_auth(self, path: str) -> None:
+        if auth_disabled():
+            self.log(DISABLED_MESSAGE, "Warning")
+            self.notify(DISABLED_MESSAGE + " " + self.tr("As autenticações do backup não foram importadas."),
+                        "Warning", 0)
+            return
         answer = QMessageBox.question(
             self, self.tr("Importar autenticação"),
             self.tr("O backup inclui configurações de autenticação (authcfg){0}. Importar agora?\n"

@@ -39,3 +39,10 @@ def test_tree_and_legacy_ows_keys():
 def test_empty_password_ignored():
     vals = {"PostgreSQL/connections/PG/password": _b(""), "PostgreSQL/connections/PG/host": _b("db")}
     assert find_credentials("PG", vals) == []
+
+
+def test_referenced_authcfg():
+    from core.credentials import referenced_authcfg
+    vals = {"connections/xyz/items/A/authcfg": _b("abc1234"), "connections/xyz/items/B/authcfg": _b(""),
+            "PostgreSQL/connections/P/authcfg": {"type": "null", "value": None}, "x/url": _b("u")}
+    assert referenced_authcfg(vals) == ["abc1234"]
