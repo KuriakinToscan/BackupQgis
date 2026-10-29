@@ -13,8 +13,8 @@ máquinas, perfis e versões do QGIS.
 | Configurações de cada plugin | Sim | Chaves `<plugin>/...`, `plugins/<plugin>/...`, `plugin_<plugin>/...` e `PythonPlugins/<plugin>`. |
 | Repositórios de plugins | Sim | Grupo `app/plugin_repositories`. |
 | Conexões de provedores | Sim | Inclui o esquema antigo (`qgis/connections-*`, `<Provedor>/connections/...`) e a árvore nova do QGIS 3.30+ (`connections/.../items/...`). |
-| Senhas e tokens | **Não, por padrão** | Podem ser incluídos marcando a opção; ficam em **texto puro** no JSON. |
-| Configurações de autenticação (authcfg) | Opcional | Arquivo `<backup>.authcfg.xml` criptografado pelo QGIS com senha escolhida na exportação (QGIS 3.20+). Importação oferecida na restauração, sem sobrescrever ids existentes. |
+| Senhas e tokens | **Não, por padrão** | Opção **Senhas: protegidas por authcfg (recomendado)**: a senha de cada conexão vira uma configuração de autenticação do QGIS e vai para `<backup>.authcfg.xml`, criptografado com uma senha escolhida na exportação; o JSON fica só com a referência `authcfg`. Opção avançada **texto puro**: senhas e tokens legíveis no JSON. |
+| Configurações de autenticação (authcfg) | Com senhas protegidas | Todas as configurações existentes vão no mesmo `.authcfg.xml` (QGIS 3.20+). A importação é oferecida na restauração, antes de gravar as conexões, sem sobrescrever ids existentes. |
 | Plugins instalados por ZIP ou de repositório privado não configurado | Sim, por padrão | Copiados para `<backup>.plugins.zip`. Na restauração, o repositório tem preferência; o ZIP é usado para os demais e extraído na pasta de plugins do perfil. |
 | Projetos e dados | Sim, na página Projetos | Ver abaixo. |
 
@@ -25,7 +25,11 @@ máquinas, perfis e versões do QGIS.
    `<pasta do perfil>/backupqgis/snapshots/` (últimas 10).
 3. **Desfazer última restauração** regrava os valores anteriores e remove as chaves criadas.
    Plugins instalados não são desinstalados.
-4. **Trocar caminho** substitui um prefixo (ex.: `C:/Users/ana` → `/home/ana`) nos valores restaurados.
+4. **Senhas protegidas**: com um `.authcfg.xml` ao lado do backup, o plugin pede a senha do arquivo
+   e importa as autenticações antes de gravar as conexões, que passam a usá-las (a senha mestra do
+   QGIS de destino é pedida pelo próprio QGIS). O banco de autenticação de origem não é alterado:
+   as configurações criadas para a exportação são removidas logo após.
+5. **Trocar caminho** substitui um prefixo (ex.: `C:/Users/ana` → `/home/ana`) nos valores restaurados.
 
 Reinicie o QGIS após restaurar para que todas as configurações tenham efeito.
 

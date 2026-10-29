@@ -61,7 +61,7 @@ assert "PostgreSQL/connections/ibama/password" not in doc["server_connections"]
 assert doc["omitted_sensitive_keys"] == ["PostgreSQL/connections/ibama/password"]
 assert [p["key"] for p in doc["plugins"]] == ["QuickOSM"]
 assert "Processing/Configuration/FOLDER" not in doc["settings"]
-assert not dlg.chk_exp_auth.isEnabled()  # stub sem QgsAuthManager
+assert dlg.cmb_secrets.findData("authcfg") == -1  # stub sem QgsAuthManager
 plugins_zip = out[:-5] + ".plugins.zip"
 import zipfile as _zf
 assert os.path.isfile(plugins_zip) and "QuickOSM/metadata.txt" in _zf.ZipFile(plugins_zip).namelist()

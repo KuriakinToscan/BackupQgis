@@ -18,7 +18,7 @@ from qgis.core import Qgis, QgsApplication, QgsMessageLog
 from qgis.gui import QgsCollapsibleGroupBox, QgsMessageBar
 from qgis.PyQt.QtCore import QSettings, QSize, Qt
 from qgis.PyQt.QtGui import QFontDatabase, QGuiApplication, QIcon
-from qgis.PyQt.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QInputDialog,
+from qgis.PyQt.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QInputDialog,
                                  QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
                                  QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy,
                                  QSpinBox, QStackedWidget, QStyle, QTabWidget, QToolButton, QVBoxLayout, QWidget)
@@ -27,6 +27,7 @@ from ..core import installer
 from ..core.backup_file import (BackupFormatError, build_backup_document, build_restore_plan, list_snapshots,
                                 load_backup, load_snapshot, save_snapshot, snapshot_dir, write_json_atomic)
 from ..core.compat import enum_value
+from ..core.credentials import Credential, apply_authcfg, find_credentials
 from ..core.deps import find_python_interpreter, is_distribution_installed, read_plugin_dependencies
 from ..core.keys import is_sensitive_key, remap_path_prefix
 from ..core.plugin_archive import PluginArchiveError, archive_keys, archive_path_for, write_plugins_archive
@@ -34,7 +35,7 @@ from ..core.plugins import resolve_plugin_name
 from ..core.settings_io import canonical, deserialize_value, read_values, serialize_value, snapshot_keys
 from ..tasks.pip_task import PipInstallTask
 from ..tasks.scan_task import ScanTask
-from .auth_io import AuthTransferError, auth_transfer_available, authcfg_path_for, export_authcfg, import_authcfg
+from .auth_io import AuthTransferError, auth_transfer_available, authcfg_path_for, export_protected, import_authcfg
 from .common import AUTO_GROUP, source_info
 from .preview_dialog import RestorePreviewDialog, build_preview_rows
 from .projects_page import ProjectsPage
@@ -216,21 +217,25 @@ class BackupPluginDialog(QDialog):
         options = QHBoxLayout()
         self.chk_exp_repos = QCheckBox(self.tr("Incluir repositórios de plugins"), page)
         self.chk_exp_repos.setChecked(True)
-        self.chk_exp_secrets = QCheckBox(self.tr("Incluir senhas e tokens (texto puro)"), page)
-        self.chk_exp_secrets.toggled.connect(self._warn_secrets)
+        self.cmb_secrets = QComboBox(page)
+        self.cmb_secrets.addItem(self.tr("Senhas: não incluir"), "none")
+        if auth_transfer_available():
+            self.cmb_secrets.addItem(self.tr("Senhas: protegidas por authcfg (recomendado)"), "authcfg")
+        self.cmb_secrets.addItem(self.tr("Senhas: texto puro no JSON (avançado)"), "plain")
+        self.cmb_secrets.setToolTip(self.tr(
+            "Protegidas: as senhas das conexões viram configurações de autenticação do QGIS e vão, com as que você "
+            "já tem, para <backup>.authcfg.xml, criptografado com uma senha escolhida na exportação. O JSON fica "
+            "sem senhas. É o caminho recomendado para guardar o backup em NAS ou HD externo (QGIS 3.20+).\n"
+            "Texto puro: senhas e tokens gravados legíveis no JSON."))
+        self.cmb_secrets.currentIndexChanged.connect(self._warn_secrets)
         self.chk_exp_zip = QCheckBox(self.tr("Incluir ZIP dos plugins fora dos repositórios"), page)
         self.chk_exp_zip.setToolTip(self.tr("Copia para <backup>.plugins.zip os plugins selecionados que não estão "
                                             "em nenhum repositório configurado (instalados por ZIP ou de repositório "
                                             "privado). Na restauração, o repositório tem preferência."))
         self.chk_exp_zip.setChecked(True)
-        self.chk_exp_auth = QCheckBox(self.tr("Exportar autenticação (authcfg) com senha"), page)
-        self.chk_exp_auth.setToolTip(self.tr("Grava <backup>.authcfg.xml, criptografado pelo QGIS com uma senha "
-                                             "que você escolhe (requer QGIS 3.20+)."))
-        self.chk_exp_auth.setEnabled(auth_transfer_available())
         options.addWidget(self.chk_exp_repos)
-        options.addWidget(self.chk_exp_secrets)
         options.addWidget(self.chk_exp_zip)
-        options.addWidget(self.chk_exp_auth)
+        options.addWidget(self.cmb_secrets)
         options.addStretch()
         layout.addLayout(options)
 
@@ -557,12 +562,11 @@ class BackupPluginDialog(QDialog):
         self.exp_counter.setText(self.tr("Selecionados: {0} plugins, configurações de {1} plugins, {2} conexões.")
                                  .format(n_plugins, n_configs, n_conns))
 
-    def _warn_secrets(self, checked: bool) -> None:
-        if checked:
+    def _warn_secrets(self, *args: Any) -> None:
+        if self.cmb_secrets.currentData() == "plain":
             QMessageBox.warning(self, self.tr("Senhas no arquivo"), self.tr(
                 "Senhas e tokens serão gravados sem criptografia no JSON. Qualquer pessoa com acesso ao arquivo "
-                "poderá lê-los. Guarde o backup em local protegido ou prefira configurações de autenticação "
-                "(authcfg) do QGIS."))
+                "poderá lê-los. Prefira a opção \"protegidas por authcfg\", que guarda as senhas criptografadas."))
 
     # ------------------------------------------------------------------
     # Exportação
@@ -597,7 +601,8 @@ class BackupPluginDialog(QDialog):
         if not self.scan:
             self.notify(self.tr("Aguarde a leitura dos plugins terminar."), "Warning")
             return
-        include_secrets = self.chk_exp_secrets.isChecked()
+        secrets_mode = self.cmb_secrets.currentData()
+        include_secrets = secrets_mode == "plain"
         index = self.scan.index
         plugins_by_key = {p["key"]: p for p in self.scan.plugins}
         conns_by_id = {c["id"]: c for c in self.scan.connections}
@@ -618,6 +623,13 @@ class BackupPluginDialog(QDialog):
             return
         if not path.lower().endswith(".json"):
             path += ".json"
+        file_pwd: Optional[str] = None
+        if secrets_mode == "authcfg":
+            file_pwd = self._ask_password(self.tr("Proteger senhas"), confirm=True)
+            if file_pwd is None:
+                self.notify(self.tr("Exportação cancelada: a senha do arquivo de autenticação é necessária para "
+                                    "incluir as senhas."), "Warning")
+                return
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -632,14 +644,38 @@ class BackupPluginDialog(QDialog):
                     (omitted.append(key) if is_sensitive_key(key) else out.append(key))
                 return out
 
+            def keep_out(values: Dict[str, Any]) -> List[str]:
+                out = [k for k in values if is_sensitive_key(k)]
+                omitted.extend(out)
+                return out
+
             plugin_settings = {pk: read_values(keep(index.plugin_keys(pk)), fallbacks=fallbacks) for pk in config_keys}
             providers = []
+            credentials: List[Credential] = []
             for cid in conn_ids:
                 conn = conns_by_id[cid]
+                if secrets_mode == "authcfg":
+                    full = read_values(conn["keys"], fallbacks=fallbacks)
+                    creds = find_credentials(f"{conn['provider_type']}: {conn['name']}", full)
+                    credentials += creds
+                    values = full
+                else:
+                    creds, values = [], read_values(keep(conn["keys"]), fallbacks=fallbacks)
                 providers.append({
                     "provider_type": conn["provider_type"], "name": conn["name"], "details": conn["details"],
-                    "keys": read_values(keep(conn["keys"]), fallbacks=fallbacks),
+                    "keys": values, "_creds": creds,
                 })
+            converted: List[str] = []
+            n_auth = 0
+            if secrets_mode == "authcfg":
+                ids, n_auth = export_protected(authcfg_path_for(path), file_pwd or "", credentials, self.log)
+                for prov in providers:
+                    values, removed = apply_authcfg(prov["keys"], prov["_creds"], ids)
+                    converted += removed
+                    # tokens e outras chaves sensíveis sem equivalente em authcfg continuam fora
+                    prov["keys"] = {k: v for k, v in values.items() if k not in keep_out(values)}
+            for prov in providers:
+                prov.pop("_creds", None)
             repos = read_values(keep(self.scan.repository_keys), fallbacks=fallbacks) \
                 if self.chk_exp_repos.isChecked() else {}
 
@@ -653,9 +689,18 @@ class BackupPluginDialog(QDialog):
                 omitted_sensitive_keys=omitted,
                 fallback_keys=fallbacks,
             )
+            if secrets_mode == "authcfg":
+                doc["authcfg_file"] = os.path.basename(authcfg_path_for(path)) if n_auth else ""
+                doc["converted_to_authcfg"] = sorted(converted)
             write_json_atomic(path, doc)
             zipped = self._export_plugin_zip(path, [plugins_by_key[k] for k in plugin_keys]) \
                 if self.chk_exp_zip.isChecked() and plugin_keys else []
+        except AuthTransferError as exc:
+            QApplication.restoreOverrideCursor()
+            self.log(self.tr("Senhas não protegidas; nada foi gravado: {0}").format(exc), "Critical")
+            QMessageBox.critical(self, self.tr("Erro"), self.tr(
+                "Não foi possível proteger as senhas com authcfg; o backup não foi gravado.\n{0}").format(exc))
+            return
         except (OSError, TypeError, ValueError) as exc:
             QApplication.restoreOverrideCursor()
             self.log(self.tr("Falha ao gravar o backup: {0}").format(exc), "Critical")
@@ -668,16 +713,17 @@ class BackupPluginDialog(QDialog):
         self.log(self.tr("Backup gravado em {0}: {1} plugins, {2} chaves de configuração, {3} conexões, "
                          "{4} chaves de repositórios.").format(path, len(plugin_keys), n_settings, len(providers),
                                                                len(repos)), "Success")
+        if converted:
+            self.log(self.tr("{0} senhas de conexões guardadas como authcfg em {1} (protegido por senha); o JSON "
+                             "não contém senhas.").format(len(converted), authcfg_path_for(path)), "Success")
         if omitted:
-            self.log(self.tr("{0} chaves de senha/token não foram exportadas.").format(len(omitted)))
+            self.log(self.tr("{0} chaves de senha/token não foram exportadas.").format(len(set(omitted))))
         for key in fallbacks:
             self.log(self.tr("Valor de tipo desconhecido gravado como texto: {0}").format(key), "Warning")
         if zipped:
             self.log(self.tr("ZIP de plugins gravado ({0}): {1}").format(len(zipped), ", ".join(zipped)), "Success")
         self.notify(self.tr("Backup gravado: {0} plugins, {1} configurações, {2} conexões.").format(
             len(plugin_keys), n_settings, len(providers)), "Success")
-        if self.chk_exp_auth.isChecked() and self.chk_exp_auth.isEnabled():
-            self._export_auth(path)
 
     def _export_plugin_zip(self, backup_path: str, plugins: List[Dict[str, Any]]) -> List[str]:
         """Grava o ZIP dos plugins que não estão em repositórios; retorna as chaves incluídas."""
@@ -710,21 +756,6 @@ class BackupPluginDialog(QDialog):
             if again == pwd:
                 return pwd
             QMessageBox.warning(self, title, self.tr("As senhas não conferem."))
-
-    def _export_auth(self, backup_path: str) -> None:
-        pwd = self._ask_password(self.tr("Exportar autenticação"), confirm=True)
-        if pwd is None:
-            self.log(self.tr("Exportação de authcfg cancelada."))
-            return
-        try:
-            n = export_authcfg(authcfg_path_for(backup_path), pwd, self.log)
-        except AuthTransferError as exc:
-            self.log(str(exc), "Warning")
-            self.notify(str(exc), "Warning", 0)
-            return
-        if n:
-            self.notify(self.tr("{0} configurações de autenticação exportadas (arquivo protegido por senha).")
-                        .format(n), "Success")
 
     # ------------------------------------------------------------------
     # Importação
@@ -935,6 +966,10 @@ class BackupPluginDialog(QDialog):
             return
         self.log(self.tr("Cópia pré-restauração: {0}").format(snap_path))
 
+        # authcfg antes das chaves: as conexões restauradas já encontram as autenticações.
+        if self.backup_authcfg and auth_transfer_available():
+            self._import_auth(self.backup_authcfg)
+
         for key, value in values.items():
             settings.setValue(key, value)
         settings.sync()
@@ -944,9 +979,6 @@ class BackupPluginDialog(QDialog):
         if plugins:
             summary = self._run_plugin_installs(plugins)
 
-        if self.backup_authcfg and auth_transfer_available():
-            self._import_auth(self.backup_authcfg)
-
         self._update_import_buttons()
         self._show_restore_summary(len(values), summary)
         self.start_scan()
@@ -954,8 +986,10 @@ class BackupPluginDialog(QDialog):
     def _import_auth(self, path: str) -> None:
         answer = QMessageBox.question(
             self, self.tr("Importar autenticação"),
-            self.tr("O backup inclui configurações de autenticação (authcfg). Importar agora?\n"
-                    "Configurações com o mesmo id já existentes nesta máquina são mantidas."))
+            self.tr("O backup inclui configurações de autenticação (authcfg){0}. Importar agora?\n"
+                    "Configurações com o mesmo id já existentes nesta máquina são mantidas.").format(
+                self.tr(", com as senhas de {0} conexões").format(len(self.backup_doc.get("converted_to_authcfg", [])))
+                if self.backup_doc and self.backup_doc.get("converted_to_authcfg") else ""))
         if answer != enum_value(QMessageBox, "StandardButton", "Yes"):
             return
         pwd = self._ask_password(self.tr("Importar autenticação"), confirm=False)

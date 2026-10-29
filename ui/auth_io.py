@@ -11,9 +11,11 @@ O arquivo fica ao lado do backup: ``qgis-backup_x.json`` ->
 ``qgis-backup_x.authcfg.xml``.
 """
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from qgis.core import QgsApplication
+
+from ..core.credentials import Credential
 
 SUFFIX = ".authcfg.xml"
 LogFn = Callable[[str], None]
@@ -72,6 +74,55 @@ def export_authcfg(path: str, password: str, log: LogFn) -> int:
         raise AuthTransferError("O QGIS não conseguiu exportar as configurações de autenticação.")
     log(f"{len(ids)} configurações de autenticação exportadas para {path}.")
     return len(ids)
+
+
+def export_protected(path: str, password: str, credentials: List[Credential], log: LogFn
+                     ) -> Tuple[Dict[str, str], int]:
+    """
+    Exporta o banco de autenticação incluindo as senhas das conexões.
+
+    Para cada senha sem authcfg, cria uma configuração Basic temporária
+    ("BackupQgis: <conexão>") com usuário e senha, exporta todas as
+    configurações para ``path`` (criptografado com ``password``) e remove as
+    temporárias do banco local, que continua como estava.
+
+    :returns: (``{chave de senha: id criado}``, quantidade de configurações exportadas).
+    :raises AuthTransferError: recurso indisponível, senha vazia ou falha do QGIS.
+    """
+    from qgis.core import QgsAuthMethodConfig
+
+    manager = _manager()
+    if manager is None:
+        raise AuthTransferError("Esta versão do QGIS não exporta configurações de autenticação (requer 3.20+).")
+    if not password:
+        raise AuthTransferError("Informe uma senha para proteger o arquivo de autenticação.")
+    _unlock(manager)
+    created: Dict[str, str] = {}
+    try:
+        for cred in credentials:
+            if cred.existing_authcfg:
+                continue
+            cfg = QgsAuthMethodConfig("Basic")
+            cfg.setName(f"BackupQgis: {cred.connection}")
+            cfg.setConfig("username", cred.username)
+            cfg.setConfig("password", cred.password)
+            stored = manager.storeAuthenticationConfig(cfg)
+            ok = stored[0] if isinstance(stored, tuple) else stored
+            if not ok or not cfg.id():
+                raise AuthTransferError(f"Não foi possível criar a autenticação de {cred.connection}.")
+            created[cred.password_key] = cfg.id()
+        ids = list(manager.configIds())
+        if not ids:
+            return created, 0
+        if not manager.exportAuthenticationConfigsToXml(path, ids, password):
+            raise AuthTransferError("O QGIS não conseguiu exportar as configurações de autenticação.")
+        log(f"{len(ids)} configurações de autenticação exportadas para {path} "
+            f"({len(created)} criadas a partir de senhas de conexões).")
+        return created, len(ids)
+    finally:
+        for cid in set(created.values()):
+            if not manager.removeAuthenticationConfig(cid):
+                log(f"Configuração temporária {cid} não pôde ser removida do banco local.")
 
 
 def import_authcfg(path: str, password: str, overwrite: bool, log: LogFn) -> None:

@@ -293,7 +293,7 @@ try:
         for k in pg_keys:
             s.remove(k)
         s.sync()
-        check("IBAMA PG" not in reg.providerMetadata("postgres").connections(), "conexão removida antes de restaurar")
+        check("IBAMA PG" not in reg.providerMetadata("postgres").connections(False), "conexão removida antes de restaurar")
         from qgis.PyQt.QtWidgets import QMessageBox
         from BackupQgis.ui import preview_dialog as P
         QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (out_json, ""))
@@ -304,7 +304,7 @@ try:
         dlg.restore_backup(simulate=False)
         print("   após restaurar:", {k: QSettings().value(k) for k in QSettings().allKeys()
                                          if "connections/IBAMA PG/" in k})
-        conns = reg.providerMetadata("postgres").connections()
+        conns = reg.providerMetadata("postgres").connections(False)
         check("IBAMA PG" in conns, "conexão PG reconhecida pelo QGIS após restaurar", list(conns))
         check("IBGE WMS" in QgsOwsConnection.connectionList("wms"), "WMS (árvore 3.30+) restaurado")
         check(tree["/connections/xyz/items/%1/http-header"].valueAsVariant(["OSM teste"]) == {"referer": "ibama"},
@@ -351,6 +351,100 @@ try:
         check(got.config("password") == "xyz", "senha do authcfg preservada")
 except Exception:
     check(False, "bloco authcfg", traceback.format_exc())
+
+# ---------------------------------------------------------------------------
+# Senhas protegidas: conexões com senha viram authcfg no backup
+# ---------------------------------------------------------------------------
+try:
+    from qgis.core import QgsDataSourceUri, QgsOwsConnection, QgsSettingsTree
+    from qgis.PyQt.QtWidgets import QFileDialog, QInputDialog, QMessageBox
+    from BackupQgis.ui import dialog as D
+    from BackupQgis.ui import preview_dialog as P
+
+    am = QgsApplication.authManager()
+    reg = QgsProviderRegistry.instance()
+    pgmd = reg.providerMetadata("postgres")
+    pgmd.createConnection("dbname='geo' host=pg.senha port=5432 user='bia' password='segredo2'", {}).store("PG senha")
+    tree = {e.definitionKey(): e for e in all_entries(QgsSettingsTree.node("connections"))}
+    wms = ["wms", "WMS senha"]
+    tree["/connections/ows/items/%1/connections/items/%2/url"].setVariantValue("https://wms.senha", wms)
+    tree["/connections/ows/items/%1/connections/items/%2/username"].setVariantValue("caio", wms)
+    tree["/connections/ows/items/%1/connections/items/%2/password"].setVariantValue("segredo3", wms)
+    QSettings().sync()
+    ids_before = sorted(am.configIds())
+
+    dlg2 = D.BackupPluginDialog(FakeIface(), REPO)
+    dlg2.show()
+    check(wait(lambda: dlg2.scan is not None), "varredura para exportação protegida")
+    idx = dlg2.cmb_secrets.findData("authcfg")
+    check(idx >= 0, "opção 'protegidas por authcfg' disponível")
+    dlg2.cmb_secrets.setCurrentIndex(idx)
+    dlg2.exp_filter.setText("")
+    dlg2.exp_conns.set_visible_checks(D.CON_CHECK, True)
+    out_p = os.path.join(BASE, "protegido.json")
+    QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (out_p, ""))
+    QInputDialog.getText = staticmethod(lambda *a, **k: ("senhaDoArquivo", True))
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+    QMessageBox.information = staticmethod(lambda *a, **k: None)
+    QMessageBox.warning = staticmethod(lambda *a, **k: None)
+    dlg2.export_backup()
+    raw = open(out_p, encoding="utf-8").read()
+    doc = json.loads(raw)
+    xml_p = os.path.join(BASE, "protegido.authcfg.xml")
+    check("segredo2" not in raw and "segredo3" not in raw and "segredo" not in raw, "JSON protegido sem senhas")
+    conv = doc.get("converted_to_authcfg", [])
+    check("PostgreSQL/connections/PG senha/password" in conv
+          and "connections/ows/items/wms/connections/items/WMS senha/password" in conv,
+          "senhas de PG e WMS convertidas em authcfg", conv)
+    pg_id = (doc["server_connections"].get("PostgreSQL/connections/PG senha/authcfg") or {}).get("value", "")
+    wms_id = (doc["server_connections"].get(
+        "connections/ows/items/wms/connections/items/WMS senha/authcfg") or {}).get("value", "")
+    check(len(pg_id) == 7 and len(wms_id) == 7, "conexões referenciam o authcfg criado", (pg_id, wms_id))
+    check(os.path.isfile(xml_p) and doc.get("authcfg_file") == "protegido.authcfg.xml", "XML de autenticação gravado")
+    xml_txt = open(xml_p, encoding="utf-8", errors="ignore").read()
+    check("segredo2" not in xml_txt and "segredo3" not in xml_txt, "XML criptografado (senhas não legíveis)")
+    check(sorted(am.configIds()) == ids_before, "banco local sem as configurações temporárias",
+          (ids_before, sorted(am.configIds())))
+    dlg2.shutdown()
+
+    # "Outra máquina": sem autenticações e sem as conexões
+    for cid in list(am.configIds()):
+        am.removeAuthenticationConfig(cid)
+    st = QSettings()
+    for k in st.allKeys():
+        if "PG senha" in k or "WMS senha" in k:
+            st.remove(k)
+    st.sync()
+    check("PG senha" not in pgmd.connections(False) and "WMS senha" not in QgsOwsConnection.connectionList("wms"),
+          "conexões e autenticações removidas")
+
+    dlg3 = D.BackupPluginDialog(FakeIface(), REPO)
+    QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (out_p, ""))
+    P.RestorePreviewDialog.exec = lambda self: 1
+    dlg3.load_backup_file()
+    check(dlg3.backup_authcfg == xml_p, "restauração encontra o XML de autenticação")
+    dlg3.restore_backup(simulate=False)
+    check(pg_id in am.configIds() and wms_id in am.configIds(), "authcfg importado na restauração",
+          sorted(am.configIds()))
+    conns = pgmd.connections(False)
+    check("PG senha" in conns, "conexão PG restaurada")
+    if "PG senha" in conns:
+        uri = QgsDataSourceUri(conns["PG senha"].uri())
+        check(uri.authConfigId() == pg_id, "conexão PG usa o authcfg", conns["PG senha"].uri())
+        expanded = uri.connectionInfo(True)
+        check("segredo2" in expanded and "bia" in expanded, "QGIS resolve usuário e senha pelo authcfg", expanded)
+    check("WMS senha" in QgsOwsConnection.connectionList("wms"), "conexão WMS restaurada")
+    got = tree["/connections/ows/items/%1/connections/items/%2/authcfg"].valueAsVariant(wms)
+    check(got == wms_id, "conexão WMS usa o authcfg", got)
+    cfg = QgsAuthMethodConfig()
+    am.loadAuthenticationConfig(wms_id, cfg, True)
+    check(cfg.config("username") == "caio" and cfg.config("password") == "segredo3",
+          "authcfg do WMS com usuário e senha")
+    check(QSettings().value("PostgreSQL/connections/PG senha/password") in (None, ""),
+          "senha não gravada em texto na conexão restaurada")
+    dlg3.shutdown()
+except Exception:
+    check(False, "bloco senhas protegidas", traceback.format_exc())
 
 # ---------------------------------------------------------------------------
 # ZIP de plugins: extração e carga real
