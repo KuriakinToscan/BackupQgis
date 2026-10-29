@@ -15,10 +15,13 @@ import json
 import os
 import platform
 import socket
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from qgis.core import Qgis, QgsApplication
-from qgis.PyQt.QtCore import QSettings
+from qgis.PyQt.QtCore import QSettings, QStandardPaths
+
+from ..core.compat import enum_value
+from ..core.destinations import default_dest, is_within, overlap_message
 
 CONFIG_GROUP = "BackupQgis/config"
 PROJECTS_GROUP = "BackupQgis/projects"
@@ -90,6 +93,68 @@ def add_config_history(entry: Dict[str, Any], settings: Any = None) -> None:
     items = [i for i in load_config_history(settings) if os.path.normcase(i["path"]) != os.path.normcase(entry["path"])]
     items.insert(0, entry)
     settings.setValue(f"{CONFIG_GROUP}/history", json.dumps(items[:HISTORY_LIMIT], ensure_ascii=False))
+
+
+def documents_dir() -> str:
+    """Pasta Documentos do usuário (ou a pasta pessoal, se o sistema não informar)."""
+    try:
+        location = QStandardPaths.writableLocation(enum_value(QStandardPaths, "StandardLocation",
+                                                              "DocumentsLocation"))
+    except (AttributeError, TypeError):
+        location = ""
+    return location or os.path.expanduser("~")
+
+
+def default_config_dir() -> str:
+    """Pasta padrão dos backups de configuração: ``<Documentos>/BackupQgis/configuracoes``."""
+    return default_dest("config", documents_dir())
+
+
+def default_projects_dir() -> str:
+    """Pasta padrão dos backups de projetos: ``<Documentos>/BackupQgis/projetos``."""
+    return default_dest("projects", documents_dir())
+
+
+def config_auto_dir(settings: Any = None) -> str:
+    """Pasta da exportação automática das configurações (vazia se não configurada)."""
+    settings = settings or QSettings()
+    return str(settings.value(f"{CONFIG_GROUP}/exportDir", "") or "").strip()
+
+
+def projects_dir(settings: Any = None) -> str:
+    """Pasta de destino do backup de projetos (vazia se não configurada)."""
+    settings = settings or QSettings()
+    return str(settings.value(f"{PROJECTS_GROUP}/dest", "") or "").strip()
+
+
+def config_conflict(folder: str, settings: Any = None) -> Optional[str]:
+    """Aviso se ``folder`` (backup de configurações) conflita com a pasta do backup de projetos."""
+    return overlap_message(folder, projects_dir(settings), "backup de projetos")
+
+
+def projects_conflict(folder: str, settings: Any = None) -> Optional[str]:
+    """Aviso se ``folder`` (backup de projetos) conflita com a pasta do backup de configurações."""
+    return overlap_message(folder, config_auto_dir(settings), "backup de configurações")
+
+
+def config_save_conflict(path: str, settings: Any = None) -> Optional[str]:
+    """Aviso se o arquivo de backup de configurações seria gravado dentro da pasta do backup de projetos."""
+    dest = projects_dir(settings)
+    if is_within(os.path.dirname(path), dest):
+        return (f"{path} fica dentro da pasta do backup de projetos ({dest}). "
+                f"Grave o backup de configurações em outra pasta, por exemplo {default_config_dir()}.")
+    return None
+
+
+def ensure_dir(folder: str) -> bool:
+    """Cria a pasta se for uma das pastas padrão; retorna ``True`` se ela existe."""
+    if not os.path.isdir(folder) and os.path.normcase(os.path.abspath(folder)) in {
+            os.path.normcase(default_config_dir()), os.path.normcase(default_projects_dir())}:
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            return False
+    return os.path.isdir(folder)
 
 
 def source_info(iface: Any) -> Dict[str, str]:

@@ -11,7 +11,8 @@ import json, os, sys, tempfile
 base = tempfile.mkdtemp()
 home = os.path.join(base, "home"); pkg = os.path.join(base, "pkg"); sett = os.path.join(base, "settings")
 for d in (home, os.path.join(pkg, "python", "plugins", "processing"), sett): os.makedirs(d, exist_ok=True)
-os.environ.update(SMOKE_HOME=home, SMOKE_PKG=pkg, SMOKE_SETTINGS=sett, QT_QPA_PLATFORM="offscreen")
+os.environ.update(SMOKE_HOME=home, SMOKE_PKG=pkg, SMOKE_SETTINGS=sett, QT_QPA_PLATFORM="offscreen",
+                  HOME=os.path.join(base, "userhome"), XDG_DOCUMENTS_DIR=os.path.join(base, "userhome", "Documents"))
 os.makedirs(os.path.join(home, "QuickOSM"))
 open(os.path.join(home, "QuickOSM", "metadata.txt"), "w").write("[general]\nname=QuickOSM\nversion=2.2\nplugin_dependencies=Plugin Inexistente\n")
 open(os.path.join(home, "QuickOSM", "requirements.txt"), "w").write("pytest>=7\npacote-inexistente-xyz\n")
@@ -128,9 +129,23 @@ pp.run_inventory()
 assert "2 arquivos" in pp.summary.text() and "1 camadas remotas" in pp.summary.text(), pp.summary.text()
 pp.run_backup()
 snaps = [d for d in os.listdir(hd) if not d.startswith(".")]
-assert len(snaps) == 1, snaps
-manifest = json.load(open(os.path.join(hd, snaps[0], "manifest.json"), encoding="utf-8"))
+assert snaps == ["mapa_bkp"], snaps
+bkp_dir = os.path.join(hd, "mapa_bkp")
+assert os.path.isfile(os.path.join(bkp_dir, "mapa.qgz")) and os.path.isfile(os.path.join(bkp_dir, "dados", "base.gpkg"))
+manifest = json.load(open(os.path.join(bkp_dir, "_backupqgis", "manifesto.json"), encoding="utf-8"))
 assert len(manifest["files"]) == 2 and "segredo" not in json.dumps(manifest)
+log_text = pd.log_view.toPlainText()
+assert "══ Backup de 1 projeto(s)" in log_text and "✔ mapa.qgz: cópia: 2 novos" in log_text, log_text
+assert "Resumo: " in log_text and pd.log_box.collapsed is False
+# a pasta da exportação automática das configurações não pode ser a dos projetos
+from qgis.gui import QgsMessageBar
+from qgis.core import QgsMessageLog
+n_msgs = len(QgsMessageBar.pushed)
+dlg.auto_export_dir.setText(os.path.join(hd, "sub"))
+dlg._save_auto_export()
+assert QSettings().value("BackupQgis/config/exportDir") != os.path.join(hd, "sub")
+assert dlg.auto_export_dir.text() != os.path.join(hd, "sub")
+assert any("backup de projetos" in t for _l, _ti, t in QgsMessageBar.pushed[n_msgs:])
 print("projects OK:", pp.summary.text())
 
 # ---- Sincronizar ----
@@ -169,12 +184,23 @@ with zipfile.ZipFile(os.path.join(pkg_out, "mapa.zip")) as z:
 assert any(n.endswith("base.gpkg") for n in names) and any(n.endswith("mapa.qgz") for n in names), names
 
 restored = os.path.join(base, "restaurado"); os.makedirs(restored)
-snap_dir = os.path.join(hd, snaps[0])
-answers = iter([snap_dir, restored])
+answers = iter([bkp_dir, restored])
 QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: next(answers))
 pp._ask = lambda title, text, buttons: "new"
+from qgis.PyQt.QtWidgets import QInputDialog
+QInputDialog.getItem = staticmethod(lambda parent, title, label, items, *a: (items[0], True))
 pp.run_restore()
-found = [os.path.join(r, f) for r, _d, fs in os.walk(restored) for f in fs]
+assert os.path.isfile(os.path.join(restored, "mapa.qgz")) and os.path.isfile(os.path.join(restored, "dados", "base.gpkg"))
+assert "✔ Arquivos restaurados: 2" in pd.log_view.toPlainText()
+# snapshot do formato anterior continua listado e restaurável
+from BackupQgis.core.project_backup import run_project_backup
+from BackupQgis.core.project_inventory import inventory_project
+legacy, _m = run_project_backup([inventory_project(qgz)], hd, {"trigger": "manual"}, lambda m: None, lambda: False,
+                                lambda d, t: None)
+restored_old = os.path.join(base, "restaurado_antigo"); os.makedirs(restored_old)
+QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: restored_old)
+pp.run_restore(legacy)
+found = [os.path.join(r, f) for r, _d, fs in os.walk(restored_old) for f in fs]
 assert any(f.endswith("mapa.qgz") for f in found) and any(f.endswith("base.gpkg") for f in found), found
 print("package/restore OK")
 
@@ -185,7 +211,7 @@ from qgis.core import QgsProject
 auto = ProjectsAutomation(FakeIface())
 cfg_auto = ConfigAutomation(FakeIface(), "0.4.0")
 QgsProject.instance().projectSaved.emit()
-versions = os.listdir(os.path.join(hd, "versoes", "mapa"))
+versions = os.listdir(os.path.join(bkp_dir, "_versoes"))
 assert len(versions) == 1 and versions[0].startswith("mapa_") and versions[0].endswith(".qgz"), versions
 
 exp_dir = os.path.join(base, "auto_export"); os.makedirs(exp_dir)
@@ -205,15 +231,16 @@ for k in auto._last_sync:
     auto._last_sync[k] -= 10 ** 6
 auto._tick()
 assert os.path.isfile(os.path.join(nas, "novo.txt"))
-# snapshot agendado e exportação agendada (relógio zerado)
-n_snaps = len([d for d in os.listdir(hd) if d[0].isdigit()])
+# backup agendado e exportação agendada (relógio zerado)
+from BackupQgis.core.project_mirror import list_states
+n_states = len(list_states(bkp_dir))
 pp.chk_schedule.setChecked(True)
 QSettings().setValue("BackupQgis/projects/lastAutoSnapshot", 0)
 auto._tick()
-snaps_now = sorted(d for d in os.listdir(hd) if d[0].isdigit())
-assert len(snaps_now) == n_snaps + 1, snaps_now
-latest = json.load(open(os.path.join(hd, snaps_now[-1], "manifest.json"), encoding="utf-8"))
-assert latest["source"]["trigger"] == "agendado"
+states = list_states(bkp_dir)
+assert len(states) == n_states + 1, states
+assert states[-1]["source"]["trigger"] == "agendado" and states[-1]["changes"]["unchanged"] == 2
+assert any("══ Backup agendado" in m for _l, m in QgsMessageLog.msgs)
 dlg.auto_export_days.setValue(1)
 QSettings().setValue("BackupQgis/config/lastAutoExport", 0)
 cfg_auto._tick()
@@ -223,8 +250,13 @@ print("automation OK")
 
 # históricos separados
 pd.history_page.refresh()
-assert pd.history_page.table.rowCount() == len(snaps_now), pd.history_page.table.rowCount()
-assert pd.history_page.table.item(0, 1).text() == "agendado"
+assert pd.history_page.table.rowCount() == len(states) + 1, pd.history_page.table.rowCount()  # + snapshot antigo
+assert [e["kind"] for e in pd.history_page.entries].count("legacy") == 1
+row = [i for i, e in enumerate(pd.history_page.entries) if e["kind"] == "mirror"][0]
+assert pd.history_page.table.item(row, 2).text() == "agendado"
+pd.history_page.table.selectRow(row)
+pd.history_page.verify_selected()
+assert "✔ Conferência SHA-256" in pd.log_view.toPlainText()
 dlg.history_page.refresh()
 kinds = sorted(e.get("kind") for e in dlg.history_page.entries)
 assert kinds.count("automático") == 2 and kinds.count("manual") == 1, kinds

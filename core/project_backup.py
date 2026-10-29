@@ -238,10 +238,15 @@ def apply_retention(dest_root: str, keep: int, log: LogFn) -> List[str]:
     return removed
 
 
+def _version_stamp() -> str:
+    return _dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+
+
 def version_project_file(project_path: str, dest_root: str, keep: int, log: LogFn) -> Optional[str]:
     """
     Guarda uma versão datada do arquivo de projeto (sem os dados), usada no
-    salvamento automático: ``<destino>/versoes/<nome>/<nome>_AAAA-MM-DD_HHMMSS.qgz``.
+    salvamento automático: ``<destino>/<nome>_bkp/_versoes/<nome>_AAAA-MM-DD_HHMMSS.qgz``
+    (mesma pasta ``_bkp`` do backup do projeto).
     Para .qgs, o ``.qgd`` vizinho também é copiado. Mantém as ``keep`` versões
     mais recentes (``keep <= 0`` mantém todas).
 
@@ -250,10 +255,11 @@ def version_project_file(project_path: str, dest_root: str, keep: int, log: LogF
     if not os.path.isdir(dest_root):
         log(f"Versão do projeto não gravada: destino não encontrado ({dest_root}).")
         return None
+    from .project_mirror import VERSIONS, resolve_bkp_dir  # import local: project_mirror importa este módulo
+
     stem, ext = os.path.splitext(os.path.basename(project_path))
-    folder = os.path.join(dest_root, "versoes", stem)
-    stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    target = os.path.join(folder, f"{stem}_{stamp}{ext}")
+    folder = os.path.join(resolve_bkp_dir(dest_root, project_path), VERSIONS)
+    target = os.path.join(folder, f"{stem}_{_version_stamp()}{ext}")
     copy_file(project_path, target)
     qgd = os.path.splitext(project_path)[0] + ".qgd"
     if ext.lower() == ".qgs" and os.path.isfile(qgd):

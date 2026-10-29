@@ -8,6 +8,7 @@ Cada janela (configurações, projetos) tem a sua instância, com log, progresso
 e tarefas próprios: uma operação numa janela não bloqueia a outra.
 """
 
+import datetime as _dt
 import os
 from typing import Any, Dict, List, Optional
 
@@ -20,9 +21,11 @@ from qgis.PyQt.QtWidgets import (QDialog, QDialogButtonBox, QFileDialog, QHBoxLa
                                  QStackedWidget, QStyle, QVBoxLayout, QWidget)
 
 from ..core.compat import enum_value
+from ..core.report import ERROR, OK, RunReport
 from .common import source_info
 
 LOG_TAG = "BackupQgis"
+REPORT_LEVELS = {OK: "Success", ERROR: "Critical"}
 
 
 def level(name: str) -> Any:
@@ -96,7 +99,7 @@ class ShellDialog(QDialog):
         self.log_view.setReadOnly(True)
         self.log_view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self.log_view.setMaximumBlockCount(5000)
-        self.log_view.setMaximumHeight(140)
+        self.log_view.setMaximumHeight(180)
         log_layout.addWidget(self.log_view)
         log_buttons = QHBoxLayout()
         btn_copy = QPushButton(self.tr("Copiar"), self.log_box)
@@ -130,9 +133,28 @@ class ShellDialog(QDialog):
     # Host das páginas: log, mensagens, estado ocupado e tarefas
     # ------------------------------------------------------------------
     def log(self, message: str, level_name: str = "Info") -> None:
-        """Registra no log da janela e no painel de mensagens do QGIS (aba BackupQgis)."""
-        self.log_view.appendPlainText(message)
+        """Registra no log da janela (com hora) e no painel de mensagens do QGIS (aba BackupQgis)."""
+        self.log_view.appendPlainText(f"[{_dt.datetime.now():%H:%M:%S}] {message}")
         QgsMessageLog.logMessage(message, LOG_TAG, level(level_name))
+
+    def log_report(self, report: RunReport, notify: bool = True) -> None:
+        """
+        Escreve no log todas as tarefas da operação e o resumo, abre o log da
+        janela e mostra o resumo na barra de mensagens (fixo se houver erro).
+        """
+        report.finish()
+        stamp = f"[{_dt.datetime.now():%H:%M:%S}]"
+        lines = report.lines()
+        self.log_view.appendPlainText("\n".join(f"{stamp} {line}" for line in lines))
+        level_name = REPORT_LEVELS.get(report.status, "Warning")
+        QgsMessageLog.logMessage("\n".join(lines), LOG_TAG, level(level_name))
+        self.log_box.setCollapsed(False)
+        self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
+        if notify:
+            text = f"{report.title}. {report.summary()}"
+            if report.status != OK:
+                text += " " + self.tr("Veja o log.")
+            self.notify(text, level_name, 0 if report.status == ERROR else 10)
 
     def notify(self, text: str, level_name: str = "Info", duration: int = 8) -> None:
         """Mensagem não modal na barra da janela."""

@@ -14,11 +14,34 @@ O plugin tem duas entradas no menu **Complementos › BackupQgis** e na barra de
 | --- | --- | --- |
 | Conteúdo | plugins, configurações, conexões, repositórios, autenticação | projetos `.qgz`/`.qgs` com os dados vinculados, pastas sincronizadas |
 | Páginas | Exportar, Importar, Histórico, Pendências | Projetos, Sincronizar, Histórico |
-| Automação | exportação ao fechar o QGIS e/ou a cada N dias | versão a cada salvamento, snapshot a cada N horas, sincronização a cada N minutos |
+| Automação | exportação ao fechar o QGIS e/ou a cada N dias | versão a cada salvamento, backup a cada N horas, sincronização a cada N minutos |
+| Pasta padrão | `<Documentos>/BackupQgis/configuracoes` | `<Documentos>/BackupQgis/projetos` |
 | Preferências | `BackupQgis/config/*` | `BackupQgis/projects/*`, `BackupQgis/sync/*` |
 
 Cada janela tem destino, retenção, log, progresso e histórico próprios; uma operação ou automação
-não dispara nem depende da outra. Preferências da 0.3.0 são migradas automaticamente.
+não dispara nem depende da outra. As pastas dos dois tipos de backup não podem coincidir nem uma
+ficar dentro da outra: o plugin recusa a escolha e explica o motivo. Preferências da 0.3.0 são
+migradas automaticamente.
+
+## Log de execução
+
+Cada operação (backup e restauração de configurações, backup, restauração, empacotamento,
+verificação e sincronização de projetos, e as automações) registra no log da janela, com hora, todas
+as tarefas executadas, cada uma com ✔ sucesso, ⚠ aviso ou ✖ erro, o detalhe (arquivos novos,
+alterados e removidos, itens ausentes, falhas) e um resumo final:
+
+```
+══ Backup de 1 projeto(s) em E:/BackupQgis/projetos ══
+✔ mapa.qgz: inventário: 8 arquivos (107.8 KiB)
+✔ mapa.qgz: cópia: 0 novos, 1 alterados, 7 sem mudança, 0 removidos; 96.0 KiB copiados para E:/BackupQgis/projetos/mapa_bkp
+    · alterado: _externos/D/dados/base.gpkg
+⚠ mapa.qgz: camadas em memória: não são gravadas em arquivo e se perdem ao fechar o QGIS
+    · Temporária
+⚠ Resumo: 3 tarefas — 2 com sucesso, 1 com aviso, 0 com erro (0.4 s).
+```
+
+O resumo aparece também na barra de mensagens da janela (fixo quando há erro). As automações gravam
+o mesmo registro no painel de mensagens do QGIS (aba BackupQgis).
 
 ## O que é copiado
 
@@ -51,31 +74,51 @@ Reinicie o QGIS após restaurar para que todas as configurações tenham efeito.
 ## Backup de projetos
 
 Na janela **Projetos e dados**, a página **Projetos** inventaria projetos `.qgz`/`.qgs` **sem abri-los no QGIS** (o XML é lido
-direto) e copia para um snapshot `AAAA-MM-DD_HHMMSS` no destino:
+direto) e copia cada projeto, com os dados que ele usa, para uma pasta única `<destino>/<projeto>_bkp`:
+
+```
+<destino>/mapa_bkp/
+    mapa.qgz, dados/..., estilos/...      cópia atual, com a estrutura da pasta do projeto
+    _externos/D/base_comum/...            dados de fora da pasta do projeto (caminho de origem)
+    _historico/2026-10-29_103000/...      versões anteriores do que mudou ou foi removido naquele backup
+    _versoes/mapa_2026-10-29_101500.qgz   arquivo de projeto a cada salvamento
+    _backupqgis/                          marcador, manifesto atual e estado de cada backup (SHA-256)
+```
 
 - dados de cada camada de arquivo e seus auxiliares (componentes de shapefile, `.ovr`, `.aux.xml`,
   world files, `.qml`, `.qmd`, fontes de `.vrt`), SVGs/imagens referenciados e o `.qgd`;
 - GeoPackage/SpatiaLite pela API de backup do SQLite, o que gera cópia íntegra mesmo com o arquivo
   aberto e em edição no QGIS;
-- `manifest.json` com SHA-256 de cada arquivo (verificado após a cópia), camadas remotas (URI sem
-  senha), camadas em memória e fontes ausentes.
+- manifesto com SHA-256 de cada arquivo (verificado após a cópia), camadas remotas (URI sem senha),
+  camadas em memória e fontes ausentes.
 
-O caminho absoluto original é espelhado dentro do snapshot (`arquivos/C/...`, `arquivos/home/...`),
-preservando os caminhos relativos entre projeto e dados. A cópia é feita em `<snapshot>.parcial` e só
-é renomeada no fim; cancelar não deixa snapshot incompleto. A retenção apaga apenas snapshots antigos
-criados pelo próprio plugin. O destino precisa existir: com o HD/NAS desconectado o backup não começa.
+**Incremental:** a cada backup só os arquivos novos ou alterados (tamanho ou data de modificação,
+tolerância de 2 s) são copiados. A versão anterior de um arquivo alterado ou removido vai para
+`_historico/<data do backup>/`, de modo que qualquer data registrada pode ser restaurada. Cada arquivo
+é copiado para um temporário, conferido pelo SHA-256 e só então substitui a cópia atual; um backup
+cancelado ou com falha mantém a cópia anterior e não registra a data. **Manter** define quantas
+datas ficam no histórico de cada projeto; o histórico que só servia às datas apagadas é removido.
+
+Projetos com o mesmo nome em pastas diferentes ganham `<projeto>_bkp_2`, `_3`... (o marcador indica
+o projeto de origem de cada pasta; o plugin nunca grava numa pasta `_bkp` alheia). O destino precisa
+existir: com o HD/NAS desconectado o backup não começa (a pasta padrão é criada automaticamente).
+
+Snapshots do formato anterior (`AAAA-MM-DD_HHMMSS/arquivos/...`, até a 0.4.x) continuam listados no
+Histórico e restauráveis, mas não são mais criados nem apagados pela retenção; remova-os à mão quando
+não forem mais necessários.
 
 - **Empacotar...** copia o projeto e os dados para `<pasta>/<projeto>/` (ou `<projeto>.zip`) e
   reescreve as fontes das camadas para caminhos relativos, de modo que o pacote abre em qualquer
   computador. A estrutura de pastas é mantida a partir da pasta comum a projeto e dados (ou espelha
   o caminho absoluto, quando estão em unidades diferentes). Camadas de banco e serviços continuam
   apontando para o servidor original.
-- **Restaurar snapshot...** devolve os arquivos aos caminhos originais (idênticos são mantidos;
+- **Restaurar...** (ou o Histórico) restaura uma pasta `_bkp` na data escolhida, ou um snapshot do
+  formato anterior, para os caminhos originais (idênticos são mantidos;
   diferentes só são substituídos se você escolher, e a versão atual vira
   `*.antes-restauracao-<data>`) ou recria tudo numa pasta nova, com os projetos reescritos para os
   arquivos restaurados.
 - **Guardar versão do projeto a cada salvamento** copia o `.qgz`/`.qgs` (sem os dados) para
-  `<destino>/versoes/<projeto>/` a cada salvamento no QGIS, mantendo as N versões mais recentes.
+  `<destino>/<projeto>_bkp/_versoes/` a cada salvamento no QGIS, mantendo as N versões mais recentes.
 
 ## Sincronização entre pastas
 
@@ -101,9 +144,11 @@ arquivo mudou dos dois lados, o mais recente vence e o outro é preservado como
 `<nome>.conflito-<máquina>-<data><ext>`; exclusões vão para a lixeira do lado correspondente. Na
 primeira execução não há exclusões, só cópias. Não tem modo automático.
 
-**Snapshot automático a cada N horas** faz o backup da lista de projetos em segundo plano enquanto o
-QGIS estiver aberto. O **Histórico** lista os snapshots do destino (manual ou agendado, arquivos,
-tamanho, falhas), com **Verificar integridade** (SHA-256 contra o manifesto) e **Restaurar**.
+**Backup automático a cada N horas** faz o backup da lista de projetos em segundo plano enquanto o
+QGIS estiver aberto (com o destino desconectado, aguarda e tenta no ciclo seguinte). O **Histórico**
+lista cada data de cada `<projeto>_bkp` (manual ou agendado, arquivos, alterações, tamanho, falhas)
+e os snapshots antigos, com **Verificar integridade** (SHA-256 contra o manifesto da data) e
+**Restaurar**.
 
 ## Exportação automática das configurações
 
@@ -146,7 +191,8 @@ Testes: `pip install pytest PyQt5 && QT_QPA_PLATFORM=offscreen python -m pytest 
 
 Integração com QGIS real (sem stubs; no CI roda com o QGIS 3.34 LTR do Ubuntu 24.04):
 `HOME=$(mktemp -d) QT_QPA_PLATFORM=offscreen python3 tests/qgis_real/run_real.py`. Cobre projetos
-gravados pelo QGIS (inventário, pacote movido e snapshot restaurado reabertos com camadas válidas),
+gravados pelo QGIS (inventário, pacote movido, snapshot e `<projeto>_bkp` restaurados em datas
+diferentes reabertos com camadas válidas),
 conexões criadas pela API e pela árvore 3.30+, exportação/restauração pelo diálogo, authcfg com
 senha mestra, instalação de plugin pelo ZIP e os sinais `projectSaved`/`aboutToQuit`.
 

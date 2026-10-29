@@ -231,6 +231,75 @@ except Exception:
     check(False, "bloco projetos", traceback.format_exc())
 
 # ---------------------------------------------------------------------------
+# Backup em <projeto>_bkp: estrutura, histórico incremental, restauração de data
+# ---------------------------------------------------------------------------
+try:
+    from BackupQgis.core.project_backup import version_project_file
+    from BackupQgis.core.project_mirror import (backup_projects, find_mirrors, list_states, restore_mirror,
+                                                verify_mirror)
+
+    hd2 = os.path.join(BASE, "hd_bkp")
+    os.makedirs(hd2)
+    report, _invs = backup_projects([qgz, qgs], hd2, {"trigger": "manual"}, 0, log, lambda: False,
+                                    lambda d, t: None)
+    log("\n".join(report.lines()))
+    check(report.count("erro") == 0, "_bkp: backup sem erros", report.lines())
+    check(sorted(os.path.basename(m) for m in find_mirrors(hd2)) == ["mapa2_bkp", "mapa_bkp"],
+          "_bkp: uma pasta por projeto", os.listdir(hd2))
+    check(sorted(os.listdir(hd2)) == ["mapa2_bkp", "mapa_bkp"], "_bkp: nenhuma outra pasta no destino",
+          os.listdir(hd2))
+    bkp = os.path.join(hd2, "mapa_bkp")
+    top = sorted(os.listdir(bkp))
+    check(top == ["_backupqgis", "_externos", "mapa.qgz"], "_bkp: estrutura da pasta do projeto", top)
+    ext_files = [os.path.join(r, f) for r, _d, fs in os.walk(os.path.join(bkp, "_externos")) for f in fs]
+    check(any(f.endswith(os.path.join("trabalho", "dados", "base.gpkg")) for f in ext_files)
+          and any(f.endswith(os.path.join("outro_disco", "rasters", "orto.tif")) for f in ext_files),
+          "_bkp: dados de fora da pasta do projeto em _externos", ext_files)
+
+    # altera o GPKG pelo próprio QGIS e faz novo backup
+    edit = QgsVectorLayer(f"{gpkg}|layername=pontos", "edição", "ogr")
+    nf = QgsFeature(edit.fields())
+    nf.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(500100, 6600000)))
+    nf.setAttribute("nome", "p3")
+    check(edit.dataProvider().addFeatures([nf])[0], "GPKG alterado pelo QGIS")
+    del edit
+    st = os.stat(gpkg)
+    os.utime(gpkg, (st.st_atime, st.st_mtime + 5))
+    report2, _i = backup_projects([qgz], hd2, {"trigger": "manual"}, 0, log, lambda: False, lambda d, t: None)
+    log("\n".join(report2.lines()))
+    states = list_states(bkp)
+    check(len(states) == 2 and states[-1]["changes"]["updated"] >= 1, "_bkp: segundo backup só com o que mudou",
+          [s.get("changes") for s in states])
+    hist = os.path.join(bkp, "_historico", states[-1]["stamp"])
+    hist_files = [f for _r, _d, fs in os.walk(hist) for f in fs]
+    check("base.gpkg" in hist_files, "_bkp: versão anterior do GPKG em _historico", hist_files)
+    check(not verify_mirror(bkp, states[0]["stamp"]) and not verify_mirror(bkp), "_bkp: integridade das duas datas")
+
+    restored_old = os.path.join(BASE, "restaurado_bkp_data1")
+    os.makedirs(restored_old)
+    stats = restore_mirror(bkp, states[0]["stamp"], restored_old, False, log, lambda: False, lambda d, t: None)
+    check(stats["failed"] == 0 and stats["projects"] == 1, "_bkp: restauração da 1ª data", stats)
+    reopen_check(os.path.join(restored_old, "mapa.qgz"), "_bkp 1ª data", os.path.join(BASE, "trabalho"),
+                 restored_old)  # confere 3 feições (antes da edição)
+
+    restored_now = os.path.join(BASE, "restaurado_bkp_atual")
+    os.makedirs(restored_now)
+    stats = restore_mirror(bkp, None, restored_now, False, log, lambda: False, lambda d, t: None)
+    p_now = QgsProject()
+    check(p_now.read(os.path.join(restored_now, "mapa.qgz")), "_bkp atual: QGIS abre o projeto")
+    lyr_now = [lyr for lyr in p_now.mapLayers().values() if lyr.name() == "Pontos GPKG"]
+    check(lyr_now and lyr_now[0].isValid() and lyr_now[0].featureCount() == 4
+          and lyr_now[0].source().startswith(restored_now), "_bkp atual: GPKG com 4 feições, na cópia",
+          lyr_now[0].source() if lyr_now else "")
+    p_now.clear()
+
+    ver = version_project_file(qgz, hd2, 5, log)
+    check(bool(ver) and os.path.dirname(ver) == os.path.join(bkp, "_versoes"), "_bkp: versão ao salvar em _versoes",
+          ver)
+except Exception:
+    check(False, "bloco _bkp", traceback.format_exc())
+
+# ---------------------------------------------------------------------------
 # Conexões criadas pela API do QGIS e varredura do diálogo
 # ---------------------------------------------------------------------------
 try:
@@ -592,7 +661,7 @@ try:
     auto = plugin.automations[1]
     project = QgsProject.instance()
     project.read(qgz)
-    folder = os.path.join(vers_dest, "versoes", "mapa")
+    folder = os.path.join(vers_dest, "mapa_bkp", "_versoes")
     for i in range(3):
         project.write()
         check(wait(lambda: os.path.isdir(folder) and len(os.listdir(folder)) >= min(i + 1, 2)),
@@ -606,15 +675,16 @@ try:
     s.setValue("BackupQgis/projects/autoSnapshot", True)
     s.setValue("BackupQgis/projects/lastAutoSnapshot", 0)
     auto._tick()
-    check(wait(lambda: not auto._tasks and any(d[0].isdigit() for d in os.listdir(vers_dest))),
-          "snapshot agendado gravado")
-    snaps = [d for d in os.listdir(vers_dest) if d[0].isdigit()]
-    if snaps:
-        man = json.loads(open(os.path.join(vers_dest, snaps[0], "manifest.json"), encoding="utf-8").read())
-        check(man["source"].get("trigger") == "agendado" and not man["errors"], "snapshot agendado sem erros")
+    from BackupQgis.core.project_mirror import list_states as _ls
+    vbkp = os.path.join(vers_dest, "mapa_bkp")
+    check(wait(lambda: not auto._tasks and len(_ls(vbkp)) == 1), "backup agendado gravado em mapa_bkp")
+    states_auto = _ls(vbkp)
+    if states_auto:
+        check(states_auto[0]["source"].get("trigger") == "agendado" and not states_auto[0]["errors"],
+              "backup agendado sem erros")
     if win_proj is not None:
         win_proj.history_page.refresh()
-        check(win_proj.history_page.table.rowCount() == len(snaps), "histórico de snapshots na janela de projetos")
+        check(win_proj.history_page.table.rowCount() == len(states_auto), "histórico na janela de projetos")
 
     QTimer.singleShot(200, app.quit)
     app.exec_()

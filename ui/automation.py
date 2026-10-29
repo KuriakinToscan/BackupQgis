@@ -9,14 +9,16 @@ próprios; a falha de uma não afeta a outra):
   plugins, configurações e conexões, sem senhas, ao fechar o QGIS e/ou a cada
   N dias;
 - :class:`ProjectsAutomation` (backup de projetos e dados): versão do arquivo
-  de projeto a cada salvamento, snapshot agendado da lista de projetos e
-  sincronização periódica dos pares aditivo/espelho.
+  de projeto a cada salvamento, backup agendado da lista de projetos (pastas
+  ``<projeto>_bkp``) e sincronização periódica dos pares aditivo/espelho.
 
-Falhas são registradas no painel de mensagens (aba BackupQgis); só problemas
-que exigem ação aparecem na barra de mensagens do QGIS.
+Cada execução registra no painel de mensagens (aba BackupQgis) as tarefas
+executadas e um resumo; só problemas que exigem ação aparecem na barra de
+mensagens do QGIS.
 """
 
 import json
+import os
 import time
 from typing import Any, Callable, Dict, List
 
@@ -25,8 +27,9 @@ from qgis.PyQt.QtCore import QObject, QSettings, QTimer
 
 from ..core.auto_export import export_all
 from ..core.compat import enum_value
-from ..core.project_backup import apply_retention, run_project_backup, version_project_file
-from ..core.project_inventory import inventory_project
+from ..core.project_backup import version_project_file
+from ..core.project_mirror import backup_projects
+from ..core.report import ERROR, OK, RunReport
 from ..core.sync import SyncAborted, parse_excludes, run_one_way
 from ..tasks.function_task import FunctionTask
 from .common import CONFIG_GROUP, PROJECTS_GROUP, SYNC_PAIRS_KEY, add_config_history, as_bool, as_int, source_info
@@ -37,6 +40,12 @@ TICK_MS = 60 * 1000
 
 def _log(message: str, level: str = "Info") -> None:
     QgsMessageLog.logMessage(message, LOG_TAG, enum_value(Qgis, "MessageLevel", level))
+
+
+def _log_report(report: RunReport) -> None:
+    """Registra todas as tarefas e o resumo no painel de mensagens."""
+    report.finish()
+    _log("\n".join(report.lines()), {OK: "Success", ERROR: "Critical"}.get(report.status, "Warning"))
 
 
 class _Base(QObject):
@@ -121,10 +130,12 @@ class ConfigAutomation(_Base):
                 "keep": as_int(s.value(f"{CONFIG_GROUP}/exportKeep", 10), 10),
                 "last": float(s.value(f"{CONFIG_GROUP}/lastAutoExport", 0) or 0)}
 
-    def _record(self, path: str) -> None:
+    def _record(self, path: str, trigger: str) -> None:
         QSettings().setValue(f"{CONFIG_GROUP}/lastAutoExport", time.time())
         add_config_history({"path": path, "kind": "automático", "secrets": "none"})
-        _log(f"Configurações exportadas automaticamente: {path}")
+        report = RunReport(f"Exportação automática das configurações ({trigger})")
+        report.ok("Plugins, configurações, conexões e repositórios (sem senhas)", path)
+        _log_report(report)
 
     def _tick(self) -> None:
         opts = self._options()
@@ -146,7 +157,7 @@ class ConfigAutomation(_Base):
                 else:
                     self._warn(f"Exportação agendada das configurações falhou: {task.error}")
             elif task.value:
-                self._record(task.value)
+                self._record(task.value, "agendada")
 
         self._start("BackupQgis: exportação agendada das configurações", work, done)
 
@@ -155,7 +166,8 @@ class ConfigAutomation(_Base):
         if not opts["on_quit"] or not opts["dir"]:
             return
         try:
-            self._record(export_all(opts["dir"], opts["keep"], self.version, source_info(self.iface), _log))
+            self._record(export_all(opts["dir"], opts["keep"], self.version, source_info(self.iface), _log),
+                         "ao fechar o QGIS")
         except (OSError, SyncAborted, ValueError) as exc:
             _log(f"Exportação automática ao sair falhou: {exc}", "Warning")
 
@@ -168,6 +180,7 @@ class ProjectsAutomation(_Base):
         self._last_sync: Dict[str, float] = {}
         self._running_pairs: set = set()
         self._snapshot_running = False
+        self._dest_missing_logged = False
         QgsProject.instance().projectSaved.connect(self._on_project_saved)
 
     def _disconnect(self) -> None:
@@ -218,33 +231,37 @@ class ProjectsAutomation(_Base):
             paths = []
         if not dest or not paths:
             return
+        if not os.path.isdir(dest):
+            if not self._dest_missing_logged:  # HD/NAS desconectado: registra uma vez e tenta a cada ciclo
+                _log(f"Backup agendado de projetos aguardando o destino: {dest} não encontrado.")
+                self._dest_missing_logged = True
+            return
+        self._dest_missing_logged = False
         keep = as_int(s.value(f"{PROJECTS_GROUP}/keep", 10), 10)
         info = dict(source_info(self.iface), trigger="agendado")
         self._snapshot_running = True
+        title = f"Backup agendado de {len(paths)} projeto(s) em {dest}"
 
         def work(task: FunctionTask) -> Any:
-            inventories = [inventory_project(p) for p in paths]
-            snap, manifest = run_project_backup(inventories, dest, info, task.log, task.isCanceled, task.report)
-            apply_retention(dest, keep, task.log)
-            return snap, manifest
+            return backup_projects(paths, dest, info, keep, task.log, task.isCanceled, task.report, title)
 
         def done(task: FunctionTask) -> None:
             self._snapshot_running = False
             if task.error:
                 if self._disconnected(task.error):
-                    _log(f"Snapshot agendado não executado: {task.error}")
+                    _log(f"Backup agendado de projetos não executado: {task.error}")
                 else:
-                    self._warn(f"Snapshot agendado falhou: {task.error}")
+                    self._warn(f"Backup agendado de projetos falhou: {task.error}")
                 return
             if not task.value:
                 return
+            report, _inventories = task.value
+            _log_report(report)
             QSettings().setValue(f"{PROJECTS_GROUP}/lastAutoSnapshot", time.time())
-            snap, manifest = task.value
-            text = f"Snapshot agendado: {snap} ({len(manifest['files'])} arquivos)."
-            (self._warn if manifest["errors"] else _log)(
-                text + (f" {len(manifest['errors'])} falhas de cópia." if manifest["errors"] else ""))
+            if report.status == ERROR:
+                self._warn(f"{report.title}: {report.summary()} Veja o painel de mensagens (aba BackupQgis).")
 
-        self._start("BackupQgis: snapshot agendado de projetos", work, done)
+        self._start("BackupQgis: backup agendado de projetos", work, done)
 
     # ------------------------------------------------------------------
     def _tick_sync(self) -> None:
@@ -284,9 +301,14 @@ class ProjectsAutomation(_Base):
                 (_log if self._disconnected(task.error) else self._warn)(msg)
                 return
             stats = task.value or {}
-            text = (f"Sincronização automática '{name}': {stats.get('copied', 0)} copiados, "
-                    f"{stats.get('updated', 0)} atualizados, {stats.get('trashed', 0)} na lixeira, "
-                    f"{stats.get('failed', 0)} falhas.")
-            (self._warn if stats.get("failed") else _log)(text)
+            report = RunReport(f"Sincronização automática '{name}'")
+            report.ok("Cópia", f"{stats.get('copied', 0)} copiados, {stats.get('updated', 0)} atualizados")
+            if stats.get("trashed"):
+                report.ok("Lixeira", f"{stats.get('trashed', 0)} arquivos movidos para a lixeira do destino")
+            if stats.get("failed"):
+                report.error("Falhas", str(stats.get("failed")), list(stats.get("errors", []))[:200])
+            _log_report(report)
+            if stats.get("failed"):
+                self._warn(f"{report.title}: {report.summary()}")
 
         self._start(f"BackupQgis: sincronização automática ({name})", work, done)

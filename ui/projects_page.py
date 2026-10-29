@@ -9,15 +9,17 @@ from typing import Any, List, Optional, Tuple
 
 from qgis.core import QgsProject
 from qgis.PyQt.QtCore import QSettings
-from qgis.PyQt.QtWidgets import (QCheckBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMessageBox,
-                                 QPushButton, QSpinBox, QToolButton, QVBoxLayout, QWidget)
+from qgis.PyQt.QtWidgets import (QCheckBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+                                 QMessageBox, QPushButton, QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
 from ..core.compat import enum_value
-from ..core.project_backup import apply_retention, run_project_backup
 from ..core.project_inventory import find_projects, inventory_project, summarize
+from ..core.project_mirror import (backup_projects, is_mirror, list_states, read_mirror_manifest,
+                                   restore_mirror)
 from ..core.project_package import build_package, read_manifest, restore_snapshot
+from ..core.report import RunReport, human_size
 from ..tasks.function_task import FunctionTask
-from .common import PROJECTS_GROUP, as_bool, as_int
+from .common import PROJECTS_GROUP, as_bool, as_int, default_projects_dir, ensure_dir, projects_conflict
 from .widgets import CheckTable, text_item
 
 SETTINGS_KEY = PROJECTS_GROUP
@@ -25,17 +27,11 @@ MAX_ROWS = 5000
 ROLE_LABELS = {"projeto": "Projeto", "dados": "Dados", "auxiliar": "Auxiliar", "recurso": "Recurso"}
 
 
-def human_size(n: float) -> str:
-    """Tamanho em unidades binárias (KiB, MiB, GiB)."""
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if n < 1024 or unit == "TiB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024.0
-    return f"{n:.1f} TiB"
+__all__ = ["ProjectsPage", "human_size"]
 
 
 class ProjectsPage(QWidget):
-    """Lista de projetos, destino, inventário e backup em snapshots."""
+    """Lista de projetos, destino, inventário e backup em ``<projeto>_bkp``."""
 
     def __init__(self, host: Any) -> None:
         """:param host: diálogo principal (log, mensagens, progresso, tarefas)."""
@@ -43,8 +39,11 @@ class ProjectsPage(QWidget):
         self.host = host
         layout = QVBoxLayout(self)
 
-        intro = QLabel(self.tr("Copia projetos (.qgz/.qgs) e os arquivos de dados que eles usam para um snapshot "
-                               "datado, com manifesto SHA-256. Camadas de banco e serviços são apenas listadas."), self)
+        intro = QLabel(self.tr("Cada projeto (.qgz/.qgs) é copiado com os dados que usa para <destino>/<projeto>_bkp, "
+                               "com a mesma estrutura de pastas da origem; dados de fora da pasta do projeto vão "
+                               "para _externos. A cada backup só o que mudou é copiado e as versões anteriores "
+                               "ficam em _historico, para restaurar qualquer data. Camadas de banco e serviços são "
+                               "apenas listadas."), self)
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -66,7 +65,8 @@ class ProjectsPage(QWidget):
 
         dest_row = QHBoxLayout()
         self.dest = QLineEdit(self)
-        self.dest.setPlaceholderText(self.tr("Pasta de destino (ex.: E:/Backups/QGIS ou //nas/backup/qgis)"))
+        self.dest.setPlaceholderText(self.tr("Pasta de destino (ex.: E:/BackupQgis/projetos ou //nas/backup/qgis/projetos)"))
+        self.dest.setToolTip(self.tr("Pasta própria dos backups de projetos, separada da pasta das configurações."))
         browse = QToolButton(self)
         browse.setText("...")
         browse.clicked.connect(self._browse_dest)
@@ -74,7 +74,8 @@ class ProjectsPage(QWidget):
         self.keep.setRange(0, 999)
         self.keep.setValue(10)
         self.keep.setSpecialValueText(self.tr("todos"))
-        self.keep.setToolTip(self.tr("Quantidade de snapshots mantidos no destino (0 = não apagar nenhum)"))
+        self.keep.setToolTip(self.tr("Datas mantidas no histórico de cada projeto (0 = todas). O histórico que só "
+                                     "servia às datas apagadas é removido."))
         dest_row.addWidget(QLabel(self.tr("Destino:"), self))
         dest_row.addWidget(self.dest, 1)
         dest_row.addWidget(browse)
@@ -85,7 +86,7 @@ class ProjectsPage(QWidget):
         extra_row = QHBoxLayout()
         self.chk_version = QCheckBox(self.tr("Guardar versão do projeto a cada salvamento"), self)
         self.chk_version.setToolTip(self.tr("Ao salvar qualquer projeto no QGIS, copia o .qgz/.qgs (sem os dados) "
-                                            "para <destino>/versoes/<nome>/ com data e hora."))
+                                            "para <destino>/<nome>_bkp/_versoes/ com data e hora."))
         self.version_keep = QSpinBox(self)
         self.version_keep.setRange(0, 999)
         self.version_keep.setValue(20)
@@ -95,9 +96,11 @@ class ProjectsPage(QWidget):
         self.btn_package.setToolTip(self.tr("Copia o projeto e os dados para uma pasta (ou ZIP) com caminhos "
                                             "relativos, que abre em qualquer computador."))
         self.btn_package.clicked.connect(self.run_package)
-        self.btn_restore = QPushButton(self.tr("Restaurar snapshot..."), self)
+        self.btn_restore = QPushButton(self.tr("Restaurar..."), self)
+        self.btn_restore.setToolTip(self.tr("Restaura uma pasta <projeto>_bkp (atual ou de uma data) ou um snapshot "
+                                            "do formato anterior."))
         self.btn_restore.clicked.connect(lambda: self.run_restore())
-        self.chk_schedule = QCheckBox(self.tr("Snapshot automático a cada"), self)
+        self.chk_schedule = QCheckBox(self.tr("Backup automático a cada"), self)
         self.chk_schedule.setToolTip(self.tr("Faz o backup da lista de projetos para o destino em segundo plano "
                                              "enquanto o QGIS estiver aberto. Independe do backup de configurações."))
         self.schedule_hours = QSpinBox(self)
@@ -133,7 +136,7 @@ class ProjectsPage(QWidget):
         self._load_settings()
         self.projects.model().rowsInserted.connect(self._save_settings)
         self.projects.model().rowsRemoved.connect(self._save_settings)
-        self.dest.editingFinished.connect(self._save_settings)
+        self.dest.editingFinished.connect(self._on_dest_edited)
         self.keep.valueChanged.connect(self._save_settings)
         self.chk_version.toggled.connect(self._save_settings)
         self.version_keep.valueChanged.connect(self._save_settings)
@@ -149,7 +152,8 @@ class ProjectsPage(QWidget):
             paths = []
         for path in paths:
             self.projects.addItem(path)
-        self.dest.setText(str(settings.value(f"{SETTINGS_KEY}/dest", "")))
+        self.dest.setText(str(settings.value(f"{SETTINGS_KEY}/dest", "") or "") or default_projects_dir())
+        self._dest_ok = self.dest.text()
         self.keep.setValue(as_int(settings.value(f"{SETTINGS_KEY}/keep", 10), 10))
         self.version_keep.setValue(as_int(settings.value(f"{SETTINGS_KEY}/versionKeep", 20), 20))
         self.chk_version.setChecked(as_bool(settings.value(f"{SETTINGS_KEY}/versionOnSave", False)))
@@ -204,11 +208,26 @@ class ProjectsPage(QWidget):
         for item in self.projects.selectedItems():
             self.projects.takeItem(self.projects.row(item))
 
+    def _accept_dest(self, folder: str) -> bool:
+        """Aceita a pasta de destino se não conflitar com a do backup de configurações."""
+        problem = projects_conflict(folder)
+        if problem:
+            self.host.notify(problem, "Warning", 0)
+            self.dest.setText(self._dest_ok)
+            return False
+        self._dest_ok = folder
+        self._save_settings()
+        return True
+
+    def _on_dest_edited(self) -> None:
+        self._accept_dest(self.dest.text().strip())
+
     def _browse_dest(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, self.tr("Pasta de destino"), self.dest.text())
+        start = self.dest.text() if os.path.isdir(self.dest.text()) else os.path.dirname(self.dest.text())
+        folder = QFileDialog.getExistingDirectory(self, self.tr("Pasta de destino"), start)
         if folder:
             self.dest.setText(folder)
-            self._save_settings()
+            self._accept_dest(folder)
 
     # ------------------------------------------------------------------
     def _fill_table(self, inventories: List[Any]) -> None:
@@ -269,39 +288,31 @@ class ProjectsPage(QWidget):
         if not dest:
             self.host.notify(self.tr("Escolha a pasta de destino."), "Warning")
             return
-        self._save_settings()
+        if not self._accept_dest(dest):
+            return
+        if not ensure_dir(dest):
+            self.host.notify(self.tr("Pasta de destino não encontrada: {0} (HD/NAS desconectado?)").format(dest),
+                             "Critical", 0)
+            return
         keep = self.keep.value()
-        source = self.host._source_info()
+        source = dict(self.host._source_info(), trigger="manual")
+        title = self.tr("Backup de {0} projeto(s) em {1}").format(len(paths), dest)
 
         def work(task: FunctionTask) -> Any:
-            inventories = [inventory_project(p) for p in paths]
-            snap, manifest = run_project_backup(inventories, dest, source, task.log, task.isCanceled, task.report)
-            removed = apply_retention(dest, keep, task.log)
-            return inventories, snap, manifest, removed
+            return backup_projects(paths, dest, source, keep, task.log, task.isCanceled, task.report, title)
 
         self._start(self.tr("Copiando projetos e dados..."), work, self._on_backup_done)
 
     def _on_backup_done(self, task: FunctionTask) -> None:
-        if not self._finish(task):
+        if not self._finish(task, report_cancel=False):
             return
-        inventories, snap, manifest, removed = task.value
+        report, inventories = task.value
         history = getattr(self.host, "history_page", None)
         if history is not None:
             history.refresh()
-        self._fill_table(inventories)
-        n_missing = sum(len(inv.missing) for inv in inventories)
-        msg = self.tr("Snapshot {0}: {1} arquivos, {2}.").format(
-            snap, len(manifest["files"]), human_size(manifest["total_bytes"]))
-        self.host.log(msg, "Success")
-        for err in manifest["errors"]:
-            self.host.log(err, "Warning")
-        if manifest["errors"] or n_missing:
-            self.host.notify(msg + " " + self.tr("{0} falhas de cópia e {1} itens ausentes; veja o log.").format(
-                len(manifest["errors"]), n_missing), "Warning", 0)
-        else:
-            self.host.notify(msg, "Success")
-        if removed:
-            self.host.log(self.tr("{0} snapshots antigos removidos.").format(len(removed)))
+        if inventories:
+            self._fill_table(inventories)
+        self.host.log_report(report)
 
     # ------------------------------------------------------------------
     def _ask(self, title: str, text: str, buttons: List[Tuple[str, str]]) -> Optional[str]:
@@ -349,37 +360,75 @@ class ProjectsPage(QWidget):
     def _on_package_done(self, task: FunctionTask) -> None:
         if not self._finish(task):
             return
-        problems = 0
-        for path, out, report, inv in task.value:
-            self.host.log(self.tr("Pacote de {0}: {1} ({2} fontes reescritas).").format(
-                os.path.basename(path), out, report.rewritten), "Success")
-            for item in report.unresolved:
-                self.host.log(self.tr("Fonte não reescrita: {0}").format(item), "Warning")
-            problems += len(report.unresolved) + len(inv.missing) + len(inv.memory)
-        msg = self.tr("{0} pacote(s) criados.").format(len(task.value))
-        if problems:
-            self.host.notify(msg + " " + self.tr("{0} itens não incluídos ou não reescritos; veja o log.").format(
-                problems), "Warning", 0)
-        else:
-            self.host.notify(msg, "Success")
+        report = RunReport(self.tr("Empacotamento de {0} projeto(s)").format(len(task.value)))
+        for path, out, pkg, inv in task.value:
+            name = os.path.basename(path)
+            if pkg.unresolved:
+                report.warn(self.tr("{0}: pacote").format(name),
+                            self.tr("{0} ({1} fontes reescritas, {2} não reescritas)").format(
+                                out, pkg.rewritten, len(pkg.unresolved)), list(pkg.unresolved))
+            else:
+                report.ok(self.tr("{0}: pacote").format(name),
+                          self.tr("{0} ({1} fontes reescritas)").format(out, pkg.rewritten))
+            if inv.missing:
+                report.warn(self.tr("{0}: itens ausentes").format(name), str(len(inv.missing)),
+                            [f"{n}: {p}" for n, p in inv.missing])
+            if inv.memory:
+                report.warn(self.tr("{0}: camadas em memória (não incluídas)").format(name), str(len(inv.memory)),
+                            list(inv.memory))
+        self.host.log_report(report)
 
-    def run_restore(self, snapshot: str = "") -> None:
-        """Restaura um snapshot (pergunta qual, se não informado) para os caminhos originais ou uma pasta nova."""
-        snapshot = snapshot or QFileDialog.getExistingDirectory(self, self.tr("Snapshot a restaurar"),
-                                                                self.dest.text())
-        if not snapshot:
+    def _choose_state(self, bkp: str) -> Optional[str]:
+        """Pergunta qual data restaurar de uma pasta ``_bkp``; ``""`` = mais recente, ``None`` = cancelado."""
+        states = list(reversed(list_states(bkp)))
+        if not states:
+            return ""
+        labels = []
+        for st in states:
+            ch = st.get("changes", {})
+            labels.append(self.tr("{0} — {1} arquivos ({2} novos, {3} alterados, {4} removidos)").format(
+                st["stamp"], len(st.get("files", [])), ch.get("copied", 0), ch.get("updated", 0),
+                ch.get("removed", 0)))
+        label, ok = QInputDialog.getItem(self, self.tr("Restaurar"), self.tr("Data a restaurar:"), labels, 0, False)
+        if not ok:
+            return None
+        return states[labels.index(label)]["stamp"]
+
+    def run_restore(self, path: str = "", stamp: Optional[str] = None) -> None:
+        """
+        Restaura uma pasta ``<projeto>_bkp`` (estado de ``stamp``; pergunta a
+        data se não informada) ou um snapshot do formato anterior, para os
+        caminhos originais ou para uma pasta nova.
+        """
+        path = path or QFileDialog.getExistingDirectory(self, self.tr("Pasta <projeto>_bkp ou snapshot a restaurar"),
+                                                        self.dest.text())
+        if not path:
             return
-        try:
-            manifest = read_manifest(snapshot)
-        except Exception as exc:  # PackageAborted: pasta errada escolhida
-            self.host.notify(str(exc), "Warning")
-            return
-        n_files = len(manifest.get("files", []))
-        mode = self._ask(
-            self.tr("Restaurar snapshot"),
-            self.tr("Snapshot de {0} com {1} arquivos e {2} projeto(s).\n\nRestaurar para:").format(
-                manifest.get("created_at", "?"), n_files, len(manifest.get("projects", []))),
-            [("new", self.tr("Pasta nova (recomendado)")), ("original", self.tr("Caminhos originais"))])
+        mirror = is_mirror(path)
+        if mirror:
+            if stamp is None:
+                stamp = self._choose_state(path)
+                if stamp is None:
+                    return
+            stamp = stamp or None
+            state = next((s for s in list_states(path) if s["stamp"] == stamp), None) if stamp else None
+            info = state or read_mirror_manifest(path)
+            if not info:
+                self.host.notify(self.tr("{0} ainda não tem backup concluído.").format(path), "Warning")
+                return
+            text = self.tr("Projeto {0}, backup de {1}, com {2} arquivos.\n\nRestaurar para:").format(
+                os.path.basename(info.get("project", "?")), info.get("stamp", "?"), len(info.get("files", [])))
+        else:
+            try:
+                manifest = read_manifest(path)
+            except Exception as exc:  # PackageAborted: pasta errada escolhida
+                self.host.notify(str(exc), "Warning")
+                return
+            text = self.tr("Snapshot (formato anterior) de {0} com {1} arquivos e {2} projeto(s).\n\n"
+                           "Restaurar para:").format(manifest.get("created_at", "?"), len(manifest.get("files", [])),
+                                                     len(manifest.get("projects", [])))
+        mode = self._ask(self.tr("Restaurar"), text,
+                         [("new", self.tr("Pasta nova (recomendado)")), ("original", self.tr("Caminhos originais"))])
         if mode is None:
             return
         target: Optional[str] = None
@@ -397,22 +446,33 @@ class ProjectsPage(QWidget):
             if choice is None:
                 return
             overwrite = choice == "overwrite"
+        title = self.tr("Restauração de {0}{1} para {2}").format(
+            os.path.basename(path), f" ({stamp})" if mirror and stamp else "",
+            target or self.tr("os caminhos originais"))
 
         def work(task: FunctionTask) -> Any:
-            return restore_snapshot(snapshot, target, overwrite, task.log, task.isCanceled, task.report)
+            if mirror:
+                return restore_mirror(path, stamp, target, overwrite, task.log, task.isCanceled, task.report)
+            return restore_snapshot(path, target, overwrite, task.log, task.isCanceled, task.report)
 
-        self._start(self.tr("Restaurando snapshot..."), work, self._on_restore_done)
+        self._restore_title = title
+        self._start(self.tr("Restaurando..."), work, self._on_restore_done)
 
     def _on_restore_done(self, task: FunctionTask) -> None:
         if not self._finish(task):
             return
         stats = task.value
-        msg = self.tr("Restauração: {0} arquivos restaurados, {1} já idênticos, {2} mantidos, {3} falhas; "
-                      "{4} projeto(s) reescritos.").format(stats["restored"], stats["skipped"], stats["kept"],
-                                                         stats["failed"], stats["projects"])
-        self.host.log(msg, "Success" if not stats["failed"] else "Warning")
-        self.host.notify(msg, "Warning" if stats["failed"] or stats["kept"] else "Success",
-                         0 if stats["failed"] else 8)
+        report = RunReport(getattr(self, "_restore_title", self.tr("Restauração")))
+        report.ok(self.tr("Arquivos restaurados"), str(stats["restored"]))
+        if stats["skipped"]:
+            report.ok(self.tr("Arquivos já idênticos (mantidos)"), str(stats["skipped"]))
+        if stats["kept"]:
+            report.warn(self.tr("Arquivos existentes e diferentes, não substituídos"), str(stats["kept"]))
+        if stats["projects"]:
+            report.ok(self.tr("Projetos com caminhos reescritos"), str(stats["projects"]))
+        if stats["failed"]:
+            report.error(self.tr("Falhas"), str(stats["failed"]), list(stats.get("errors", [])))
+        self.host.log_report(report)
 
     # ------------------------------------------------------------------
     def _start(self, label: str, work: Any, on_done: Any) -> None:
@@ -424,11 +484,17 @@ class ProjectsPage(QWidget):
         task.progressChanged.connect(lambda p: self.host._set_progress(int(p), 100))
         self.host._keep_task(task)
 
-    def _finish(self, task: FunctionTask) -> bool:
-        """Encerra o estado ocupado; retorna ``True`` se a tarefa terminou com resultado."""
+    def _finish(self, task: FunctionTask, report_cancel: bool = True) -> bool:
+        """
+        Encerra o estado ocupado; retorna ``True`` se a tarefa terminou com resultado.
+
+        :param report_cancel: avisar o cancelamento (``False`` quando a própria
+            tarefa devolve um registro que já o inclui).
+        """
         self.host._drop_task(task)
         self.host._set_busy(False)
-        if task.isCanceled():
+        if task.isCanceled() and (report_cancel or task.value is None):
+            self.host.log(self.tr("Operação cancelada."), "Warning")
             self.host.notify(self.tr("Operação cancelada."), "Warning")
             return False
         if task.error:

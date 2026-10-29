@@ -18,6 +18,7 @@ from ..core.sync import (BiPlan, SyncAborted, build_bidirectional_plan, build_pl
                          init_marker, load_state, parse_excludes, read_marker, save_state, scan_tree)
 from .common import SYNC_PAIRS_KEY, sync_state_path
 from ..tasks.function_task import FunctionTask
+from ..core.report import RunReport
 from .projects_page import human_size
 from .widgets import CheckTable, text_item
 
@@ -391,6 +392,8 @@ class SyncPage(QWidget):
             return {"copied": stats["a_to_b"] + stats["b_to_a"], "updated": stats["conflicts"],
                     "trashed": stats["trashed"], "failed": stats["failed"]}
 
+        self._sync_title = self.tr("Sincronização bidirecional {0} ⇄ {1}").format(pair.get("source", ""),
+                                                                                  pair.get("dest", ""))
         self._start(self.tr("Sincronizando nos dois sentidos..."), work, self._on_synced)
 
     def synchronize(self) -> None:
@@ -423,6 +426,7 @@ class SyncPage(QWidget):
             guard_plan(plan, force=force)
             return execute_plan(plan, task.log, task.isCanceled, task.report)
 
+        self._sync_title = self.tr("Sincronização {0} → {1}").format(pair.get("source", ""), pair.get("dest", ""))
         self._start(self.tr("Sincronizando..."), work, self._on_synced)
 
     def _on_synced(self, task: FunctionTask) -> None:
@@ -432,8 +436,14 @@ class SyncPage(QWidget):
         stats = task.value
         text = self.tr("Sincronização concluída: {0} copiados, {1} atualizados, {2} na lixeira, {3} falhas.").format(
             stats["copied"], stats["updated"], stats["trashed"], stats["failed"])
-        self.host.log(text, "Warning" if stats["failed"] else "Success")
-        self.host.notify(text, "Warning" if stats["failed"] else "Success")
+        report = RunReport(getattr(self, "_sync_title", self.tr("Sincronização")))
+        report.ok(self.tr("Arquivos copiados"), str(stats["copied"]))
+        report.ok(self.tr("Arquivos atualizados"), str(stats["updated"]))
+        if stats["trashed"]:
+            report.ok(self.tr("Arquivos movidos para a lixeira (.backupqgis_trash)"), str(stats["trashed"]))
+        if stats["failed"]:
+            report.error(self.tr("Falhas de cópia"), self.tr("{0}; detalhes nas linhas acima").format(stats["failed"]))
+        self.host.log_report(report)
         self.summary.setText(text)
         self.table.set_rows([], [])
 

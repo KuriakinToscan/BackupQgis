@@ -34,7 +34,9 @@ from ..tasks.pip_task import PipInstallTask
 from ..tasks.scan_task import ScanTask
 from .auth_io import (DISABLED_MESSAGE, AuthTransferError, auth_disabled, auth_transfer_available, authcfg_path_for,
                       export_protected, import_authcfg)
-from .common import CONFIG_GROUP, add_config_history, as_bool, as_int
+from ..core.report import ERROR, OK, WARN, RunReport
+from .common import (CONFIG_GROUP, add_config_history, as_bool, as_int, config_conflict, config_save_conflict,
+                     default_config_dir, ensure_dir)
 from .config_history import ConfigHistoryPage
 from .preview_dialog import RestorePreviewDialog, build_preview_rows
 from .shell import ShellDialog
@@ -189,7 +191,8 @@ class BackupPluginDialog(ShellDialog):
         settings = QSettings()
         self.chk_auto_export.setChecked(as_bool(settings.value(f"{CONFIG_GROUP}/exportOnQuit", False)))
         self.auto_export_days.setValue(as_int(settings.value(f"{CONFIG_GROUP}/exportEveryDays", 0), 0))
-        self.auto_export_dir.setText(str(settings.value(f"{CONFIG_GROUP}/exportDir", "")))
+        self.auto_export_dir.setText(str(settings.value(f"{CONFIG_GROUP}/exportDir", "") or "") or default_config_dir())
+        self._auto_dir_ok = self.auto_export_dir.text()
         self.auto_export_keep.setValue(as_int(settings.value(f"{CONFIG_GROUP}/exportKeep", 10), 10))
         self.chk_auto_export.toggled.connect(self._save_auto_export)
         self.auto_export_days.valueChanged.connect(self._save_auto_export)
@@ -428,6 +431,14 @@ class BackupPluginDialog(ShellDialog):
         folder = self.auto_export_dir.text().strip()
         if (self.chk_auto_export.isChecked() or self.auto_export_days.value()) and not folder:
             self.notify(self.tr("Escolha a pasta da exportação automática."), "Warning")
+        problem = config_conflict(folder)
+        if problem:
+            self.notify(problem, "Warning", 0)
+            self.auto_export_dir.setText(self._auto_dir_ok)
+            folder = self._auto_dir_ok
+        self._auto_dir_ok = folder
+        if folder and (self.chk_auto_export.isChecked() or self.auto_export_days.value()):
+            ensure_dir(folder)
         settings = QSettings()
         settings.setValue(f"{CONFIG_GROUP}/exportOnQuit", self.chk_auto_export.isChecked())
         settings.setValue(f"{CONFIG_GROUP}/exportEveryDays", self.auto_export_days.value())
@@ -435,7 +446,12 @@ class BackupPluginDialog(ShellDialog):
         settings.setValue(f"{CONFIG_GROUP}/exportKeep", self.auto_export_keep.value())
 
     def _last_dir(self) -> str:
-        return str(QSettings().value(f"{CONFIG_GROUP}/lastDir", os.path.expanduser("~")))
+        """Última pasta usada; na primeira vez, a pasta padrão ``<Documentos>/BackupQgis/configuracoes``."""
+        folder = str(QSettings().value(f"{CONFIG_GROUP}/lastDir", "") or "")
+        if folder and os.path.isdir(folder):
+            return folder
+        default = default_config_dir()
+        return default if ensure_dir(default) else os.path.expanduser("~")
 
     def _remember_dir(self, path: str) -> None:
         QSettings().setValue(f"{CONFIG_GROUP}/lastDir", os.path.dirname(path))
@@ -467,6 +483,10 @@ class BackupPluginDialog(ShellDialog):
             return
         if not path.lower().endswith(".json"):
             path += ".json"
+        problem = config_save_conflict(path)
+        if problem:
+            QMessageBox.warning(self, self.tr("Pasta do backup de projetos"), problem)
+            return
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -550,36 +570,52 @@ class BackupPluginDialog(ShellDialog):
                 if self.chk_exp_zip.isChecked() and plugin_keys else []
         except AuthTransferError as exc:
             QApplication.restoreOverrideCursor()
-            self.log(self.tr("Senhas não protegidas; nada foi gravado: {0}").format(exc), "Critical")
+            report = RunReport(self.tr("Backup das configurações"))
+            report.error(self.tr("Proteção das senhas (authcfg)"), self.tr("{0}; nada foi gravado").format(exc))
+            self.log_report(report, notify=False)
             QMessageBox.critical(self, self.tr("Erro"), self.tr(
                 "Não foi possível proteger as senhas com authcfg; o backup não foi gravado.\n{0}").format(exc))
             return
         except (OSError, TypeError, ValueError) as exc:
             QApplication.restoreOverrideCursor()
-            self.log(self.tr("Falha ao gravar o backup: {0}").format(exc), "Critical")
+            report = RunReport(self.tr("Backup das configurações"))
+            report.error(self.tr("Gravação do backup"), str(exc))
+            self.log_report(report, notify=False)
             QMessageBox.critical(self, self.tr("Erro"), self.tr("Falha ao gravar o backup:\n{0}").format(exc))
             return
         QApplication.restoreOverrideCursor()
 
         self._remember_dir(path)
         n_settings = len(doc["settings"])
-        self.log(self.tr("Backup gravado em {0}: {1} plugins, {2} chaves de configuração, {3} conexões, "
-                         "{4} chaves de repositórios.").format(path, len(plugin_keys), n_settings, len(providers),
-                                                               len(repos)), "Success")
-        if converted:
-            self.log(self.tr("{0} senhas de conexões guardadas como authcfg em {1} (protegido por senha); o JSON "
-                             "não contém senhas.").format(len(converted), authcfg_path_for(path)), "Success")
+        report = RunReport(self.tr("Backup das configurações em {0}").format(path))
+        report.ok(self.tr("Plugins"), self.tr("{0} na lista de reinstalação").format(len(plugin_keys)),
+                  list(plugin_keys))
+        report.ok(self.tr("Configurações de plugins"), self.tr("{0} chaves de {1} plugins").format(
+            n_settings, len(config_keys)))
+        report.ok(self.tr("Conexões"), str(len(providers)),
+                  [f"{p['provider_type']}: {p['name']}" for p in providers])
+        if self.chk_exp_repos.isChecked():
+            report.ok(self.tr("Repositórios de plugins"), self.tr("{0} chaves").format(len(repos)))
+        if secrets_mode == "authcfg":
+            if converted or n_auth:
+                report.ok(self.tr("Senhas protegidas (authcfg)"),
+                          self.tr("{0} senhas convertidas, {1} autenticações em {2}; o JSON não contém senhas").format(
+                              len(converted), n_auth, authcfg_path_for(path)))
+            else:
+                report.ok(self.tr("Senhas protegidas (authcfg)"),
+                          self.tr("nenhuma senha nem authcfg nas conexões selecionadas"))
+        elif secrets_mode == "plain":
+            report.warn(self.tr("Senhas"), self.tr("gravadas em texto puro no JSON"))
         if omitted:
-            self.log(self.tr("{0} chaves de senha/token não foram exportadas.").format(len(set(omitted))))
-        for key in fallbacks:
-            self.log(self.tr("Valor de tipo desconhecido gravado como texto: {0}").format(key), "Warning")
+            report.ok(self.tr("Chaves de senha/token não exportadas"), str(len(set(omitted))))
+        if fallbacks:
+            report.warn(self.tr("Valores de tipo desconhecido gravados como texto"), str(len(fallbacks)), fallbacks)
         if zipped:
-            self.log(self.tr("ZIP de plugins gravado ({0}): {1}").format(len(zipped), ", ".join(zipped)), "Success")
-        self.notify(self.tr("Backup gravado: {0} plugins, {1} configurações, {2} conexões.").format(
-            len(plugin_keys), n_settings, len(providers)), "Success")
+            report.ok(self.tr("ZIP de plugins fora dos repositórios"), archive_path_for(path), zipped)
         add_config_history({"path": path, "kind": "manual", "plugins": len(plugin_keys),
                             "connections": len(providers), "secrets": secrets_mode})
         self.history_page.refresh()
+        self.log_report(report)
 
     def _export_plugin_zip(self, backup_path: str, plugins: List[Dict[str, Any]]) -> List[str]:
         """Grava o ZIP dos plugins que não estão em repositórios; retorna as chaves incluídas."""
@@ -824,31 +860,43 @@ class BackupPluginDialog(ShellDialog):
             QMessageBox.critical(self, self.tr("Erro"), self.tr(
                 "Não foi possível salvar a cópia de segurança; nada foi alterado.\n{0}").format(exc))
             return
-        self.log(self.tr("Cópia pré-restauração: {0}").format(snap_path))
+        report = RunReport(self.tr("Restauração de {0}").format(os.path.basename(self.backup_path or "")))
+        report.ok(self.tr("Cópia pré-restauração (para desfazer)"), snap_path)
 
         # authcfg antes das chaves: as conexões restauradas já encontram as autenticações.
         if self.backup_authcfg and auth_transfer_available():
-            self._import_auth(self.backup_authcfg)
+            status, detail = self._import_auth(self.backup_authcfg)
+            report.add(self.tr("Autenticações (authcfg)"), status, detail)
 
-        for key, value in values.items():
-            settings.setValue(key, value)
-        settings.sync()
-        self.log(self.tr("{0} chaves gravadas no QSettings.").format(len(values)), "Success")
+        try:
+            for key, value in values.items():
+                settings.setValue(key, value)
+            settings.sync()
+            report.ok(self.tr("Chaves gravadas no QSettings"), str(len(values)))
+        except Exception as exc:  # QSettings não costuma falhar; registra se acontecer
+            report.error(self.tr("Chaves gravadas no QSettings"), str(exc))
 
         summary = {"installed": [], "activated": [], "failed": [], "restart": []}
         if plugins:
             summary = self._run_plugin_installs(plugins)
+            if summary["installed"]:
+                report.ok(self.tr("Plugins instalados"), str(len(summary["installed"])), summary["installed"])
+            if summary["activated"]:
+                report.ok(self.tr("Plugins ativados"), str(len(summary["activated"])), summary["activated"])
+            if summary["failed"]:
+                report.error(self.tr("Plugins com falha"), str(len(summary["failed"])), summary["failed"])
 
         self._update_import_buttons()
+        self.log_report(report, notify=False)
         self._show_restore_summary(len(values), summary)
         self.start_scan()
 
-    def _import_auth(self, path: str) -> None:
+    def _import_auth(self, path: str) -> Tuple[str, str]:
+        """Oferece a importação do authcfg do backup; retorna (situação, detalhe) para o registro."""
         if auth_disabled():
-            self.log(DISABLED_MESSAGE, "Warning")
             self.notify(DISABLED_MESSAGE + " " + self.tr("As autenticações do backup não foram importadas."),
                         "Warning", 0)
-            return
+            return WARN, DISABLED_MESSAGE
         answer = QMessageBox.question(
             self, self.tr("Importar autenticação"),
             self.tr("O backup inclui configurações de autenticação (authcfg){0}. Importar agora?\n"
@@ -856,16 +904,16 @@ class BackupPluginDialog(ShellDialog):
                 self.tr(", com as senhas de {0} conexões").format(len(self.backup_doc.get("converted_to_authcfg", [])))
                 if self.backup_doc and self.backup_doc.get("converted_to_authcfg") else ""))
         if answer != enum_value(QMessageBox, "StandardButton", "Yes"):
-            return
+            return WARN, self.tr("importação recusada; as conexões que usam authcfg ficam sem senha")
         pwd = self._ask_password(self.tr("Importar autenticação"), confirm=False)
         if pwd is None:
-            return
+            return WARN, self.tr("senha do arquivo não informada; nada importado")
         try:
             import_authcfg(path, pwd, False, self.log)
-            self.log(self.tr("Configurações de autenticação importadas."), "Success")
+            return OK, path
         except AuthTransferError as exc:
-            self.log(str(exc), "Warning")
             self.notify(str(exc), "Warning", 0)
+            return ERROR, str(exc)
 
     def _run_plugin_installs(self, keys: List[str]) -> Dict[str, List[str]]:
         self._set_busy(True, self.tr("Instalando e ativando plugins..."), cancellable=True)

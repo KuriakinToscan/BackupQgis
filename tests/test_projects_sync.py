@@ -283,19 +283,11 @@ def test_version_project_file_keeps_latest(tmp_path, monkeypatch):
     dest = tmp_path / "dest"
     dest.mkdir()
     stamps = iter(["2026-01-01_000001", "2026-01-01_000002", "2026-01-01_000003"])
-
-    class FakeDT:
-        @staticmethod
-        def now():
-            class N:
-                def strftime(self, fmt):
-                    return next(stamps)
-            return N()
-
-    monkeypatch.setattr(pb._dt, "datetime", FakeDT)
+    monkeypatch.setattr(pb, "_version_stamp", lambda: next(stamps))
     for _ in range(3):
         assert version_project_file(str(proj), str(dest), 2, lambda m: None)
-    folder = dest / "versoes" / "mapa"
+    folder = dest / "mapa_bkp" / "_versoes"
+    assert (dest / "mapa_bkp" / "_backupqgis" / "marcador.json").is_file()
     assert sorted(os.listdir(folder)) == ["mapa_2026-01-01_000002.qgd", "mapa_2026-01-01_000002.qgs",
                                           "mapa_2026-01-01_000003.qgd", "mapa_2026-01-01_000003.qgs"]
 
