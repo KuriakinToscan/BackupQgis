@@ -35,6 +35,8 @@ from ..core.settings_io import canonical, deserialize_value, read_values, serial
 from ..tasks.pip_task import PipInstallTask
 from ..tasks.scan_task import ScanTask
 from .preview_dialog import RestorePreviewDialog, build_preview_rows
+from .projects_page import ProjectsPage
+from .sync_page import SyncPage
 from .widgets import CheckTable, check_item, text_item
 
 LOG_TAG = "BackupQgis"
@@ -94,7 +96,7 @@ class BackupPluginDialog(QDialog):
         return icon
 
     def _build_ui(self) -> None:
-        self.setWindowTitle(self.tr("BackupQgis — plugins, configurações e conexões"))
+        self.setWindowTitle(self.tr("BackupQgis — plugins, configurações, conexões, projetos e sincronização"))
         self.setWindowIcon(QIcon(os.path.join(self.plugin_dir, "icon.png")))
         self.resize(980, 680)
         self.setMinimumSize(760, 520)
@@ -122,6 +124,10 @@ class BackupPluginDialog(QDialog):
 
         self._add_page(self._build_export_page(), self.tr("Exportar"), self._icon("/mActionFileSave.svg", sp.SP_DialogSaveButton))
         self._add_page(self._build_import_page(), self.tr("Importar"), self._icon("/mActionFileOpen.svg", sp.SP_DialogOpenButton))
+        self.projects_page = ProjectsPage(self)
+        self._add_page(self.projects_page, self.tr("Projetos"), self._icon("/mIconQgsProjectFile.svg", sp.SP_FileIcon))
+        self.sync_page = SyncPage(self)
+        self._add_page(self.sync_page, self.tr("Sincronizar"), self._icon("/mActionRefresh.svg", sp.SP_BrowserReload))
         self._add_page(self._build_deps_page(), self.tr("Pendências"), self._icon("/mIconWarning.svg", sp.SP_MessageBoxWarning))
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.nav.setCurrentRow(0)

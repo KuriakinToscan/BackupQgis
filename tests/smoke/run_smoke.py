@@ -95,8 +95,60 @@ assert "3 dependências verificadas, 2 ausentes" in dlg.dep_summary.text()
 dlg.exp_filter.setText("ibge")
 dlg.exp_conns.set_visible_checks(D.CON_CHECK, False)
 assert dlg.exp_conns.checked_ids(D.CON_CHECK) == ["PostGIS::ibama"]
+
+# ---- Projetos ----
+import sqlite3, zipfile
+proj = os.path.join(base, "proj"); os.makedirs(os.path.join(proj, "dados"))
+con = sqlite3.connect(os.path.join(proj, "dados", "base.gpkg")); con.execute("create table t(a)"); con.commit(); con.close()
+qgs = ('<qgis><projectlayers><maplayer><layername>A</layername><provider>ogr</provider>'
+       '<datasource>./dados/base.gpkg|layername=t</datasource></maplayer>'
+       '<maplayer><layername>PG</layername><provider>postgres</provider><datasource>dbname=x password=segredo</datasource></maplayer>'
+       '</projectlayers></qgis>')
+qgz = os.path.join(proj, "mapa.qgz")
+with zipfile.ZipFile(qgz, "w") as z:
+    z.writestr("mapa.qgs", qgs)
+from qgis.core import QgsProject
+QgsProject.instance()._file = qgz
+hd = os.path.join(base, "hd"); os.makedirs(hd)
+pp = dlg.projects_page
+pp.add_current()
+assert pp.project_paths() == [qgz]
+pp.dest.setText(hd)
+pp.run_inventory()
+assert "2 arquivos" in pp.summary.text() and "1 camadas remotas" in pp.summary.text(), pp.summary.text()
+pp.run_backup()
+snaps = [d for d in os.listdir(hd) if not d.startswith(".")]
+assert len(snaps) == 1, snaps
+manifest = json.load(open(os.path.join(hd, snaps[0], "manifest.json"), encoding="utf-8"))
+assert len(manifest["files"]) == 2 and "segredo" not in json.dumps(manifest)
+print("projects OK:", pp.summary.text())
+
+# ---- Sincronizar ----
+src = os.path.join(base, "sig"); os.makedirs(os.path.join(src, "sub"))
+open(os.path.join(src, "a.txt"), "w").write("a")
+open(os.path.join(src, "sub", "b.txt"), "w").write("b")
+nas = os.path.join(base, "nas"); os.makedirs(nas)
+sp = dlg.sync_page
+sp.name.setText("SIG"); sp.source.setText(src); sp.dest.setText(nas)
+sp.simulate()
+assert os.path.exists(os.path.join(nas, ".backupqgis-target.json"))
+assert sp.btn_sync.isEnabled() and "2 novos" in sp.summary.text(), sp.summary.text()
+sp.synchronize()
+assert open(os.path.join(nas, "sub", "b.txt")).read() == "b"
+sp.simulate()
+assert not sp.btn_sync.isEnabled() and "0 novos" in sp.summary.text(), sp.summary.text()
+# destino desconectado
+import shutil
+shutil.move(nas, nas + "_off")
+from qgis.gui import QgsMessageBar
+n_before = len(QgsMessageBar.pushed)
+sp.simulate()
+assert any("conectado" in t for _l, _ti, t in QgsMessageBar.pushed[n_before:]), QgsMessageBar.pushed[n_before:]
+assert not os.path.exists(nas)
+print("sync OK")
+
 from qgis.core import QgsMessageLog
-errs = [m for l, m in QgsMessageLog.msgs if l == 2]
+errs = [m for l, m in QgsMessageLog.msgs if l == 2 and "conectado" not in m]
 print("errors:", errs)
 dlg.shutdown()
 print("SMOKE OK")

@@ -16,7 +16,7 @@ máquinas, perfis e versões do QGIS.
 | Senhas e tokens | **Não, por padrão** | Podem ser incluídos marcando a opção; ficam em **texto puro** no JSON. |
 | Configurações de autenticação (authcfg) | Não | Conexões que usam authcfg precisam da configuração criada na máquina de destino. |
 | Plugins instalados por ZIP ou de repositório privado não configurado | Não | Aparecem como falha na restauração. |
-| Projetos e dados | Não | Ver [issue #1](https://github.com/KuriakinToscan/BackupQgis/issues/1). |
+| Projetos e dados | Sim, na página Projetos | Ver abaixo. |
 
 ## Restauração segura
 
@@ -28,6 +28,40 @@ máquinas, perfis e versões do QGIS.
 4. **Trocar caminho** substitui um prefixo (ex.: `C:/Users/ana` → `/home/ana`) nos valores restaurados.
 
 Reinicie o QGIS após restaurar para que todas as configurações tenham efeito.
+
+## Backup de projetos
+
+A página **Projetos** inventaria projetos `.qgz`/`.qgs` **sem abri-los no QGIS** (o XML é lido
+direto) e copia para um snapshot `AAAA-MM-DD_HHMMSS` no destino:
+
+- dados de cada camada de arquivo e seus auxiliares (componentes de shapefile, `.ovr`, `.aux.xml`,
+  world files, `.qml`, `.qmd`, fontes de `.vrt`), SVGs/imagens referenciados e o `.qgd`;
+- GeoPackage/SpatiaLite pela API de backup do SQLite, o que gera cópia íntegra mesmo com o arquivo
+  aberto e em edição no QGIS;
+- `manifest.json` com SHA-256 de cada arquivo (verificado após a cópia), camadas remotas (URI sem
+  senha), camadas em memória e fontes ausentes.
+
+O caminho absoluto original é espelhado dentro do snapshot (`arquivos/C/...`, `arquivos/home/...`),
+preservando os caminhos relativos entre projeto e dados. A cópia é feita em `<snapshot>.parcial` e só
+é renomeada no fim; cancelar não deixa snapshot incompleto. A retenção apaga apenas snapshots antigos
+criados pelo próprio plugin. O destino precisa existir: com o HD/NAS desconectado o backup não começa.
+
+## Sincronização entre pastas
+
+A página **Sincronizar** mantém pares origem → destino (ex.: `D:/SIG` → `//nas/backup/SIG`):
+
+- **Aditivo**: copia novos e alterados; nunca apaga no destino.
+- **Espelho**: remove do destino o que não existe mais na origem, movendo para
+  `.backupqgis_trash/AAAA-MM-DD_HHMMSS/` no próprio destino.
+
+Proteções: simulação obrigatória antes de cada execução; marcador `.backupqgis-target.json` com UUID
+no destino (reconhece o disco mesmo após troca de letra no Windows e impede gravar no disco local
+quando o HD/NAS não está montado); origem vazia aborta; espelho que apagaria mais de 20% dos arquivos
+do destino pede confirmação; cópia atômica que preserva a data de modificação; tolerância de 2 s
+na comparação (FAT/exFAT/SMB); arquivo mais recente no destino não é sobrescrito.
+
+Fora do escopo atual: sincronização bidirecional, gatilhos automáticos e restauração de snapshot
+pela interface (fase 3 da issue #1).
 
 ## Pendências
 

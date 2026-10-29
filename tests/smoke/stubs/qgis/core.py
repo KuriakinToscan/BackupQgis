@@ -32,3 +32,12 @@ class QgsTask(QObject):
     def setProgress(self, p): self.progressChanged.emit(float(p))
     def isCanceled(self): return self._c
     def cancel(self): self._c = True
+class QgsProject:
+    _inst = None
+    def __init__(self): self._file = os.environ.get("SMOKE_PROJECT", ""); self._dirty = False
+    @staticmethod
+    def instance():
+        if QgsProject._inst is None: QgsProject._inst = QgsProject()
+        return QgsProject._inst
+    def fileName(self): return self._file
+    def isDirty(self): return self._dirty
