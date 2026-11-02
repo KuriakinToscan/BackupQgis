@@ -102,7 +102,7 @@ def documents_dir() -> str:
                                                               "DocumentsLocation"))
     except (AttributeError, TypeError):
         location = ""
-    return location or os.path.expanduser("~")
+    return os.path.normpath(location or os.path.expanduser("~"))
 
 
 def default_config_dir() -> str:
@@ -144,6 +144,12 @@ def config_save_conflict(path: str, settings: Any = None) -> Optional[str]:
         return (f"{path} fica dentro da pasta do backup de projetos ({dest}). "
                 f"Grave o backup de configurações em outra pasta, por exemplo {default_config_dir()}.")
     return None
+
+
+def clean_dir(folder: str) -> str:
+    """Caminho de pasta com os separadores do sistema (o Qt devolve ``/`` no Windows); vazio fica vazio."""
+    folder = (folder or "").strip()
+    return os.path.normpath(folder) if folder else ""
 
 
 def ensure_dir(folder: str) -> bool:

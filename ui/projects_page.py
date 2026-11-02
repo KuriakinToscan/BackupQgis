@@ -19,7 +19,7 @@ from ..core.project_mirror import (backup_projects, is_mirror, list_states, read
 from ..core.project_package import build_package, read_manifest, restore_snapshot
 from ..core.report import RunReport, human_size
 from ..tasks.function_task import FunctionTask
-from .common import PROJECTS_GROUP, as_bool, as_int, default_projects_dir, ensure_dir, projects_conflict
+from .common import PROJECTS_GROUP, as_bool, as_int, clean_dir, default_projects_dir, ensure_dir, projects_conflict
 from .widgets import CheckTable, text_item
 
 SETTINGS_KEY = PROJECTS_GROUP
@@ -152,7 +152,7 @@ class ProjectsPage(QWidget):
             paths = []
         for path in paths:
             self.projects.addItem(path)
-        self.dest.setText(str(settings.value(f"{SETTINGS_KEY}/dest", "") or "") or default_projects_dir())
+        self.dest.setText(clean_dir(str(settings.value(f"{SETTINGS_KEY}/dest", "") or "")) or default_projects_dir())
         self._dest_ok = self.dest.text()
         self.keep.setValue(as_int(settings.value(f"{SETTINGS_KEY}/keep", 10), 10))
         self.version_keep.setValue(as_int(settings.value(f"{SETTINGS_KEY}/versionKeep", 20), 20))
@@ -210,6 +210,9 @@ class ProjectsPage(QWidget):
 
     def _accept_dest(self, folder: str) -> bool:
         """Aceita a pasta de destino se não conflitar com a do backup de configurações."""
+        folder = clean_dir(folder)
+        if folder != self.dest.text():
+            self.dest.setText(folder)
         problem = projects_conflict(folder)
         if problem:
             self.host.notify(problem, "Warning", 0)
@@ -281,7 +284,7 @@ class ProjectsPage(QWidget):
 
     def run_backup(self) -> None:
         paths = self.project_paths()
-        dest = self.dest.text().strip()
+        dest = clean_dir(self.dest.text())
         if not paths:
             self.host.notify(self.tr("Adicione ao menos um projeto."), "Warning")
             return

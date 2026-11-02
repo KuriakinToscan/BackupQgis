@@ -78,6 +78,9 @@ class CheckTable(QTableView):
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.verticalHeader().setVisible(False)
+        # Caminhos sem espaços quebrariam logo após "C:" e o resto ficaria oculto: uma linha, abreviada no meio.
+        self.setWordWrap(False)
+        self.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.setMinimumHeight(140)
         header = self.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)

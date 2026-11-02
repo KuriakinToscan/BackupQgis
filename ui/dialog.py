@@ -35,8 +35,8 @@ from ..tasks.scan_task import ScanTask
 from .auth_io import (DISABLED_MESSAGE, AuthTransferError, auth_disabled, auth_transfer_available, authcfg_path_for,
                       export_protected, import_authcfg)
 from ..core.report import ERROR, OK, WARN, RunReport
-from .common import (CONFIG_GROUP, add_config_history, as_bool, as_int, config_conflict, config_save_conflict,
-                     default_config_dir, ensure_dir)
+from .common import (CONFIG_GROUP, add_config_history, as_bool, as_int, clean_dir, config_conflict,
+                     config_save_conflict, default_config_dir, ensure_dir)
 from .config_history import ConfigHistoryPage
 from .preview_dialog import RestorePreviewDialog, build_preview_rows
 from .shell import ShellDialog
@@ -191,7 +191,8 @@ class BackupPluginDialog(ShellDialog):
         settings = QSettings()
         self.chk_auto_export.setChecked(as_bool(settings.value(f"{CONFIG_GROUP}/exportOnQuit", False)))
         self.auto_export_days.setValue(as_int(settings.value(f"{CONFIG_GROUP}/exportEveryDays", 0), 0))
-        self.auto_export_dir.setText(str(settings.value(f"{CONFIG_GROUP}/exportDir", "") or "") or default_config_dir())
+        self.auto_export_dir.setText(clean_dir(str(settings.value(f"{CONFIG_GROUP}/exportDir", "") or ""))
+                                     or default_config_dir())
         self._auto_dir_ok = self.auto_export_dir.text()
         self.auto_export_keep.setValue(as_int(settings.value(f"{CONFIG_GROUP}/exportKeep", 10), 10))
         self.chk_auto_export.toggled.connect(self._save_auto_export)
@@ -428,7 +429,9 @@ class BackupPluginDialog(ShellDialog):
             self._save_auto_export()
 
     def _save_auto_export(self, *args: Any) -> None:
-        folder = self.auto_export_dir.text().strip()
+        folder = clean_dir(self.auto_export_dir.text())
+        if folder != self.auto_export_dir.text():
+            self.auto_export_dir.setText(folder)
         if (self.chk_auto_export.isChecked() or self.auto_export_days.value()) and not folder:
             self.notify(self.tr("Escolha a pasta da exportação automática."), "Warning")
         problem = config_conflict(folder)
