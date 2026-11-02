@@ -1,0 +1,44 @@
+name: testes
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Instalar dependências de teste
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libegl1 libxkbcommon0 libgl1 libdbus-1-3
+          python -m pip install --upgrade pip
+          python -m pip install pytest pyflakes PyQt5
+      - name: Pyflakes
+        run: python -m pyflakes core tasks ui backup_plugin.py __init__.py
+      - name: Pytest
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests
+
+  qgis-real:
+    # Integração com QGIS real (pacote python3-qgis do Ubuntu 24.04, QGIS 3.34 LTR), sem stubs.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar QGIS
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            python3-qgis qgis-providers python3-pyqt5 python3-gdal
+      - name: Teste de integração
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          export HOME="$(mktemp -d)"
+          /usr/bin/python3 -W ignore tests/qgis_real/run_real.py
